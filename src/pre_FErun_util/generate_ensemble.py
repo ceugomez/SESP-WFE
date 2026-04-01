@@ -47,6 +47,8 @@ import stat
 
 import numpy as np
 
+from generate_boundary_planes import generate_boundary_planes, generate_ic
+
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
@@ -80,20 +82,32 @@ parser.add_argument("--spd",        type=float, default=DEFAULT_SPD,
                     help="Geostrophic wind speed, constant across ensemble (m/s)")
 parser.add_argument("--seed",       type=int,   default=DEFAULT_SEED,
                     help="NumPy random seed for reproducibility")
-parser.add_argument("--truth_dir",  type=float, default=DEFAULT_MU_DIR,
+parser.add_argument("--truth_dir",  type=float, default=None,
                     help="Wind direction (met. degrees) for the held-out truth member. "
-                         "This member is NOT part of the ensemble and is not used to "
-                         "construct the POD basis — it demonstrates that the basis "
-                         "generalises to out-of-sample realisations.")
+                         "If omitted (default), the truth direction is drawn as an "
+                         "additional independent sample from the same N(mu_dir, sigma_dir) "
+                         "distribution, keeping it out-of-sample. Supply an explicit value "
+                         "only to pin the truth to a specific direction.")
+parser.add_argument("--runs_dir",   type=str,   default=None,
+                    help="Root directory for member output (default: workspace/runs/). "
+                         "Set to a new path (e.g. ../runs_lad) to keep old runs intact.")
+parser.add_argument("--ic_template",  type=str,   default=None,
+                    help="Path to an existing FastEddy output .nc file to use as the "
+                         "grid-coordinate template when generating per-member IC files "
+                         "(needed for hydroBCs=1 boundary-plane loading). "
+                         "Example: runs_lad/member_truth/output/FE_Membertruth.0")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-script_dir = os.path.dirname(os.path.abspath(__file__))
-runs_dir   = os.path.dirname(script_dir)          # …/workspace/runs/
-topo_file  = os.path.join(script_dir, "setup", "terrain.bin")
-template_file = os.path.join(script_dir, "ensemble_mean_member_1gpu.in")
+script_dir    = os.path.dirname(os.path.abspath(__file__))
+workspace_dir = os.path.dirname(script_dir)       # …/workspace/
+runs_dir      = (os.path.abspath(args.runs_dir)
+                 if args.runs_dir is not None
+                 else os.path.join(workspace_dir, "runs"))
+topo_file     = os.path.join(workspace_dir, "runs", "ensemble_fp", "setup", "terrain.bin")
+template_file = os.path.join(workspace_dir, "runs", "ensemble_fp", "ensemble_mean_member_1gpu.in")
 
 for path, label in [(template_file, "Template"), (topo_file, "Terrain file")]:
     if not os.path.isfile(path):
@@ -106,6 +120,7 @@ with open(template_file) as f:
 required_placeholders = [
     "OUTPATH_PLACEHOLDER", "MEMBER_PLACEHOLDER",
     "TOPOFILE_PLACEHOLDER", "UG_PLACEHOLDER", "VG_PLACEHOLDER",
+    "BNDYS_PLACEHOLDER", "INPATH_PLACEHOLDER", "INFILE_PLACEHOLDER",
 ]
 missing = [p for p in required_placeholders if p not in template_text]
 if missing:
@@ -117,14 +132,25 @@ if missing:
 # ---------------------------------------------------------------------------
 # Sample wind directions
 # ---------------------------------------------------------------------------
-rng  = np.random.default_rng(args.seed)
-dirs = rng.normal(args.mu_dir, args.sigma_dir, args.n_members)
+rng = np.random.default_rng(args.seed)
+if args.truth_dir is not None:
+    # Pinned truth direction: draw only the prior members.
+    dirs      = rng.normal(args.mu_dir, args.sigma_dir, args.n_members)
+    truth_dir = args.truth_dir
+else:
+    # Draw n_members + 1 directions in one call so the truth member is a
+    # genuine independent sample from the same distribution (not the mean).
+    all_dirs  = rng.normal(args.mu_dir, args.sigma_dir, args.n_members + 1)
+    dirs      = all_dirs[:args.n_members]
+    truth_dir = float(all_dirs[-1])
 
 print(f"Ensemble: {args.n_members} prior members  +  1 held-out truth member")
 print(f"  Wind direction  : N(mu={args.mu_dir:.1f} deg, sigma={args.sigma_dir:.1f} deg)")
 print(f"  Wind speed      : {args.spd:.1f} m/s")
 print(f"  Random seed     : {args.seed}")
-print(f"  Sampled dirs    : {' '.join(f'{d:.1f} deg' for d in dirs)}")
+print(f"  Prior dirs      : {' '.join(f'{d:.1f} deg' for d in dirs)}")
+print(f"  Truth dir       : {truth_dir:.1f} deg"
+      + (" (pinned)" if args.truth_dir is not None else " (sampled)"))
 print()
 
 # ---------------------------------------------------------------------------
@@ -141,9 +167,23 @@ for i, met_dir in enumerate(dirs):
     member_dir = os.path.join(runs_dir, f"member_{tag}")
     output_dir = os.path.join(member_dir, "output")
     log_dir    = os.path.join(member_dir, "log")
+    icbc_dir   = os.path.join(member_dir, "ICBC")
 
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(log_dir,    exist_ok=True)
+
+    # -- Boundary planes (LAD inflow) -------------------------------------
+    bndys_base = generate_boundary_planes(icbc_dir, "FE_Bndys", ug, vg)
+
+    # -- Initial condition file (required for hydroBCs=1 BC loading) ------
+    ic_base = f"FE_Member{tag}"
+    if args.ic_template is not None:
+        generate_ic(args.ic_template, output_dir, f"{ic_base}.0", ug, vg)
+        inpath_val = output_dir + "/"
+        infile_val = f"{ic_base}.0"
+    else:
+        inpath_val = ""
+        infile_val = ""
 
     # -- Namelist ----------------------------------------------------------
     text = (template_text
@@ -151,7 +191,10 @@ for i, met_dir in enumerate(dirs):
             .replace("MEMBER_PLACEHOLDER",   tag)
             .replace("TOPOFILE_PLACEHOLDER",  topo_file)
             .replace("UG_PLACEHOLDER",        f"{ug:.6f}")
-            .replace("VG_PLACEHOLDER",        f"{vg:.6f}"))
+            .replace("VG_PLACEHOLDER",        f"{vg:.6f}")
+            .replace("BNDYS_PLACEHOLDER",     bndys_base)
+            .replace("INPATH_PLACEHOLDER",    inpath_val)
+            .replace("INFILE_PLACEHOLDER",    infile_val))
 
     in_file = os.path.join(member_dir, f"FE_ensemble_{tag}.in")
     with open(in_file, "w") as f:
@@ -203,23 +246,38 @@ srun --mpi=pmi2 -n 1 $SRCDIR/FastEddy $RUNDIR/FE_ensemble_{tag}.in
 # ---------------------------------------------------------------------------
 # Truth member (held-out, not in the POD basis)
 # ---------------------------------------------------------------------------
-truth_rad = math.radians(args.truth_dir)
+truth_rad = math.radians(truth_dir)
 truth_ug  = -args.spd * math.sin(truth_rad)
 truth_vg  = -args.spd * math.cos(truth_rad)
 
 truth_dir_path = os.path.join(runs_dir, "member_truth")
 truth_output   = os.path.join(truth_dir_path, "output")
 truth_log      = os.path.join(truth_dir_path, "log")
+truth_icbc_dir = os.path.join(truth_dir_path, "ICBC")
 
 os.makedirs(truth_output, exist_ok=True)
 os.makedirs(truth_log,    exist_ok=True)
 
+truth_bndys_base = generate_boundary_planes(truth_icbc_dir, "FE_Bndys",
+                                             truth_ug, truth_vg)
+
+if args.ic_template is not None:
+    generate_ic(args.ic_template, truth_output, "FE_Membertruth.0",
+                truth_ug, truth_vg)
+    truth_inpath_val = truth_output + "/"
+    truth_infile_val = "FE_Membertruth.0"
+else:
+    truth_inpath_val = ""
+    truth_infile_val = ""
 truth_text = (template_text
               .replace("OUTPATH_PLACEHOLDER",  truth_output + "/")
               .replace("MEMBER_PLACEHOLDER",   "truth")
               .replace("TOPOFILE_PLACEHOLDER",  topo_file)
               .replace("UG_PLACEHOLDER",        f"{truth_ug:.6f}")
-              .replace("VG_PLACEHOLDER",        f"{truth_vg:.6f}"))
+              .replace("VG_PLACEHOLDER",        f"{truth_vg:.6f}")
+              .replace("BNDYS_PLACEHOLDER",     truth_bndys_base)
+              .replace("INPATH_PLACEHOLDER",    truth_inpath_val)
+              .replace("INFILE_PLACEHOLDER",    truth_infile_val))
 
 truth_in_file = os.path.join(truth_dir_path, "FE_ensemble_truth.in")
 with open(truth_in_file, "w") as f:
@@ -252,7 +310,7 @@ os.chmod(truth_run_script, os.stat(truth_run_script).st_mode | stat.S_IXUSR | st
 
 truth_member_config = {
     "id":          "truth",
-    "met_dir_deg": round(args.truth_dir, 4),
+    "met_dir_deg": round(truth_dir, 4),
     "U_g_ms":      round(truth_ug, 6),
     "V_g_ms":      round(truth_vg, 6),
     "namelist":    truth_in_file,
@@ -262,7 +320,7 @@ truth_member_config = {
 }
 
 print()
-print(f"  member_truth [TRUTH]:  dir={args.truth_dir:7.3f} deg  "
+print(f"  member_truth [TRUTH]:  dir={truth_dir:7.3f} deg  "
       f"U_g={truth_ug:+8.4f} m/s  V_g={truth_vg:+8.4f} m/s")
 
 config = {
@@ -272,7 +330,7 @@ config = {
         "sigma_dir_deg": args.sigma_dir,
         "spd_ms":       args.spd,
         "seed":         args.seed,
-        "truth_dir_deg": args.truth_dir,
+        "truth_dir_deg": truth_dir,
         "template":     template_file,
         "topo_file":    topo_file,
     },
@@ -280,7 +338,8 @@ config = {
     "prior_members": config_members,
 }
 
-config_file = os.path.join(script_dir, "ensemble_config.json")
+os.makedirs(runs_dir, exist_ok=True)
+config_file = os.path.join(runs_dir, "ensemble_config.json")
 with open(config_file, "w") as f:
     json.dump(config, f, indent=2)
 
@@ -288,7 +347,7 @@ print()
 print(f"Config written : {config_file}")
 print()
 print("Truth / prior split:")
-print(f"  Truth  (held-out, sample measurements from) : member_truth  dir={args.truth_dir:.1f} deg")
+print(f"  Truth  (held-out, sample measurements from) : member_truth  dir={truth_dir:.1f} deg")
 print(f"  Prior  (POD basis + GMF prior)              : "
       + ", ".join(f"member_{m['id']}" for m in config_members))
 print()
