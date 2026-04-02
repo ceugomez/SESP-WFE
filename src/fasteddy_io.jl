@@ -59,6 +59,22 @@ end
 
 # Reconstruct NCfield for member `member_idx` (1-based) from the full snapshot matrix.
 # U is (state_dim, M*T) as built by build_snapshot_matrix; t_spinup must match what was used to build it.
+# overloaded to get a single member (usually truth), or
+function reconstruct_NCfield(U::Matrix{Float32}, member::MemberInfo,
+                              grid::GridInfo;
+                              t_spinup::Float64=900.0) :: NCfield
+    mask  = _spinup_mask(member, t_spinup)
+    T     = sum(mask)
+    t_vec = member.sim_times[mask]
+    u4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T)
+    v4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T)
+    w4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T)
+    for (i, col) in enumerate(1:T)
+        u4[:,:,:,i], v4[:,:,:,i], w4[:,:,:,i] = unpack_snapshot(view(U, :, col), grid)
+    end
+    return NCfield(t_vec, grid, u4, v4, w4)
+end
+# with the whole U matrix, used to reconstruct arbitrary member for visualization or whatever. 
 function reconstruct_NCfield(U::Matrix{Float32}, config::EnsembleConfig,
                               member_idx::Int, grid::GridInfo;
                               t_spinup::Float64=900.0) :: NCfield

@@ -3,13 +3,14 @@
 using LinearAlgebra
 
 # ---- Configuration ----
-const CONFIG_PATH  = "/home/cego6160/workspace/runs/ensemble_fp/ensemble_config.json"   # ensemble config file that we generated when we generated ensemble namelists
-const WORKDIR      = "/home/cego6160/workspace/prediction/src"                          # where stuff should go (except simulation files)
-const L            = 150          # number of POD modes to retain
+const CONFIG_PATH  = "/home/cego6160/workspace/runs/ensemble_config.json"
+const WORKDIR      = "/home/cego6160/workspace/prediction/src"
+const OUTPUT_DIR   = "/home/cego6160/workspace/prediction/output"
+const L            = 50          # number of POD modes to retain
 const T_SPINUP     = 900.0       # seconds — exclude spin-up transient behavior (default 15 min)
-const BASIS_FILE   = joinpath(WORKDIR, "pod_basis.jld2")
+const BASIS_FILE   = joinpath(OUTPUT_DIR, "pod_basis.jld2")
 include(joinpath(WORKDIR, "fasteddy_io.jl"))    # utilities to load and manipulate fasteddy data
-include(joinpath(WORKDIR, "pod_ensemble.jl"))   # this is where all the POD functions live
+include(joinpath(WORKDIR, "pod.jl"))   # this is where all the POD functions live
 
 
 # allocate threads for decomposition
@@ -28,4 +29,5 @@ save_pod_basis(basis, BASIS_FILE)
 
 @info "Saved POD basis to file"
 @info "=== Done ==="
+
 

@@ -1,6 +1,7 @@
 # cgf cego6160@colorado.edu
 # Gaussian Mixture Filter for POD coefficient space
 using Distributions
+include(joinpath(WORKDIR, "pod.jl"))            # POD utilities
 # structure definition
 struct GMFilter
     K       :: Int              # number of mixture components (one per ensemble member)
@@ -36,8 +37,8 @@ function init_prior(basis::PODBasis, M::Int) :: GMFilter
         vars[m, :]  = vec(var(a_m, dims=2))         # temporal variance per mode
     end
 
-    weights = fill(Float32(1/M), M)
+    weights = fill(Float32(1/M), M)     # equal weight given to each ensemble member for now
 
-    return GMFilter(M, L, weights, means, vars)
+    return GMFilter(M, L, weights, means, vars) # sum of gaussian with mean and variance for each 
 end
 

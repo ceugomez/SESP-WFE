@@ -2,7 +2,7 @@
 #SBATCH --job-name=pod_ensemble_allsteps
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=256G
 #SBATCH --time=2:00:00
 #SBATCH --output=/home/cego6160/workspace/prediction/log/pod_%j.log
@@ -21,6 +21,6 @@ echo "CPUs: $SLURM_CPUS_PER_TASK   Mem: $(grep MemTotal /proc/meminfo | awk '{pr
 
 julia --startup-file=no \
       --threads=$SLURM_CPUS_PER_TASK \
-      /home/cego6160/workspace/prediction/src/run_pod.jl
+      /home/cego6160/workspace/prediction/scripts/run_pod.jl
 
 echo "Job $SLURM_JOB_ID finished at $(date)"

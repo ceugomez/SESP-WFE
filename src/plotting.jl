@@ -1,7 +1,7 @@
 # cgf cego6160@colorado.edu 
 # 4.1.26
 # Plotting utilities for use on POD modal decomposition and GM 
-
+using Distributions, Plots, StatsPlots
 
 #TBD TBD TBD TBD
 # should really have: 1 to plot gaussian mixture, 1 to plot x/z and x/y mode shape 
@@ -46,8 +46,27 @@ function ascii_slice(field::NCfield, t_idx::Int; plane::Symbol=:xy, fixed_idx::I
 end                                                                                                                                       
                
   
-function plot_gaussian_mixture(g::GMFilter, coeff_idx::Int=2)
-    # plot gaussian filter mixture model for coefficient a
-    x = Normal()
-
+function plot_gaussian_mixture(g::GMFilter, coeff_idx::Int=1)
+    @info("GMFilter: K=$(g.K) components, L=$(g.L) modes")
+    @info("  weights: $(g.weights)")
+    @info("  means[:, $(coeff_idx)]:  $(g.means[:, coeff_idx])")
+    @info("  vars[:, $(coeff_idx)]:   $(g.vars[:, coeff_idx])")
+    components = [Normal(g.means[k, coeff_idx], sqrt(g.vars[k, coeff_idx])) for k in 1:g.K]
+    mixture = MixtureModel(components, g.weights)
+    plot(mixture,
+         components=false,
+         label="Total Mixture Density",
+         linewidth=4,
+         color=:black,
+         title="GMM: Sum vs. Components (Coeff $(coeff_idx))",
+         xlabel="Coefficient value",
+         ylabel="Density",
+         legend=:topright)
+    plot!(mixture,
+          components=true,
+          label="", # Prevents 10 identical entries in the legend
+          linestyle=:dash,
+          alpha=0.5,
+          linewidth=1.5)
+    savefig("/home/cego6160/workspace/prediction/output/combined_mixture_coeff$(coeff_idx).png")
 end
