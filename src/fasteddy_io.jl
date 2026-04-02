@@ -37,18 +37,48 @@ struct GridInfo
     state_dim :: Int                 # 3 * n_grid
 end
 
-# repacked wind field structure
+# repacked wind field for a single member over time
 struct NCfield
-    t    :: Vector{Float32} # timestamp vector in seconds
-    grid :: GridInfo        # LES grid 
-    u    :: Matrix{Matrix{Float32}} # Zonal wind, in m/s.  
-    v    :: Matrix{Matrix{Float32}} # Meridional wind, in m/s
-    w    :: Matrix{Matrix{Float32}} # Vertical wind, in m/s
+    t    :: Vector{Float32}      # (T,) timestamps in seconds
+    grid :: GridInfo              # LES grid
+    u    :: Array{Float32,4}     # (Nx, Ny, Nz, T) zonal wind, m/s
+    v    :: Array{Float32,4}     # (Nx, Ny, Nz, T) meridional wind, m/s
+    w    :: Array{Float32,4}     # (Nx, Ny, Nz, T) vertical wind, m/s
 end
 
 
 # ---------- output functions ----------------
+# Unpack a single flat state vector [u;v;w] back into 3D fields.
+function unpack_snapshot(x::AbstractVector{Float32}, grid::GridInfo)
+    n = grid.n_grid
+    u = reshape(x[1:n],    grid.Nx, grid.Ny, grid.Nz)
+    v = reshape(x[n+1:2n], grid.Nx, grid.Ny, grid.Nz)
+    w = reshape(x[2n+1:3n], grid.Nx, grid.Ny, grid.Nz)
+    return u, v, w
+end
 
+# Reconstruct NCfield for member `member_idx` (1-based) from the full snapshot matrix.
+# U is (state_dim, M*T) as built by build_snapshot_matrix; t_spinup must match what was used to build it.
+function reconstruct_NCfield(U::Matrix{Float32}, config::EnsembleConfig,
+                              member_idx::Int, grid::GridInfo;
+                              t_spinup::Float64=900.0) :: NCfield
+    member = config.prior_members[member_idx]
+    mask   = _spinup_mask(member, t_spinup)
+    T      = sum(mask)
+    t_vec  = member.sim_times[mask]
+
+    # columns for this member in the snapshot matrix
+    col_start = (member_idx - 1) * T + 1
+    col_end   = member_idx * T
+
+    u4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T)
+    v4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T)
+    w4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T)
+    for (i, col) in enumerate(col_start:col_end)
+        u4[:,:,:,i], v4[:,:,:,i], w4[:,:,:,i] = unpack_snapshot(view(U, :, col), grid)
+    end
+    return NCfield(t_vec, grid, u4, v4, w4)
+end
 
 
 # ---------- input functions ------------------ 

@@ -96,18 +96,117 @@ parser.add_argument("--ic_template",  type=str,   default=None,
                          "grid-coordinate template when generating per-member IC files "
                          "(needed for hydroBCs=1 boundary-plane loading). "
                          "Example: runs_lad/member_truth/output/FE_Membertruth.0")
+parser.add_argument("--periodic_runs_dir", type=str, default=None,
+                    help="Root directory of completed periodic-BC runs "
+                         "(default: workspace/runs/). Each member_XX subdirectory "
+                         "should contain a namelist FE_ensemble_XX.in and "
+                         "output/FE_MemberXX.180000. When provided, boundary planes "
+                         "are built from the Ekman profile of the closest-direction "
+                         "periodic member rather than an analytic geostrophic profile.")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 script_dir    = os.path.dirname(os.path.abspath(__file__))
-workspace_dir = os.path.dirname(script_dir)       # …/workspace/
+# script is at workspace/prediction/src/pre_FErun_util/ → go up 3 levels
+workspace_dir = os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))
 runs_dir      = (os.path.abspath(args.runs_dir)
                  if args.runs_dir is not None
                  else os.path.join(workspace_dir, "runs"))
 topo_file     = os.path.join(workspace_dir, "runs", "ensemble_fp", "setup", "terrain.bin")
 template_file = os.path.join(workspace_dir, "runs", "ensemble_fp", "ensemble_mean_member_1gpu.in")
+
+# ---------------------------------------------------------------------------
+# Periodic-run profile lookup (for Ekman-spiral boundary planes)
+# ---------------------------------------------------------------------------
+def _build_periodic_lookup(periodic_runs_dir: str) -> list:
+    """
+    Scan *periodic_runs_dir* for member subdirectories (member_00, member_01,
+    …, member_truth) that have a completed final output file.  Read Ug/Vg from
+    each member's namelist.
+
+    Returns a list of dicts:
+        [{"ug": float, "vg": float, "nc_path": str}, ...]
+    sorted by member name.  Members with missing output are skipped.
+    """
+    import re
+    entries = []
+    for entry in sorted(os.listdir(periodic_runs_dir)):
+        member_path = os.path.join(periodic_runs_dir, entry)
+        if not os.path.isdir(member_path):
+            continue
+        m = re.match(r"member_(\w+)$", entry)
+        if m is None:
+            continue
+        tag = m.group(1)
+        # Find the namelist: FE_ensemble_{tag}.in
+        nl = os.path.join(member_path, f"FE_ensemble_{tag}.in")
+        if not os.path.isfile(nl):
+            continue
+        # Parse Ug / Vg from namelist
+        ug_val = vg_val = None
+        with open(nl) as fh:
+            for line in fh:
+                lstrip = line.strip()
+                if lstrip.startswith("U_g"):
+                    try:
+                        ug_val = float(lstrip.split("=")[1].split("#")[0].strip())
+                    except (IndexError, ValueError):
+                        pass
+                elif lstrip.startswith("V_g"):
+                    try:
+                        vg_val = float(lstrip.split("=")[1].split("#")[0].strip())
+                    except (IndexError, ValueError):
+                        pass
+        if ug_val is None or vg_val is None:
+            continue
+        # Find the latest output file (highest timestep number)
+        output_dir = os.path.join(member_path, "output")
+        if not os.path.isdir(output_dir):
+            continue
+        prefix = f"FE_Member{tag}."
+        candidates = [
+            os.path.join(output_dir, f) for f in os.listdir(output_dir)
+            if f.startswith(prefix) and f[len(prefix):].isdigit()
+        ]
+        if not candidates:
+            continue
+        nc_path = max(candidates, key=lambda p: int(os.path.basename(p).split(".")[1]))
+        entries.append({"ug": ug_val, "vg": vg_val, "nc_path": nc_path, "tag": tag})
+    return entries
+
+
+def _closest_periodic(periodic_lookup: list, ug: float, vg: float) -> str:
+    """
+    Return the nc_path of the periodic member whose wind direction is closest
+    (in angular distance) to the target (ug, vg).
+    """
+    target_angle = math.atan2(vg, ug)
+    best_nc   = None
+    best_dist = float("inf")
+    for entry in periodic_lookup:
+        src_angle = math.atan2(entry["vg"], entry["ug"])
+        dist = abs(math.atan2(math.sin(target_angle - src_angle),
+                               math.cos(target_angle - src_angle)))
+        if dist < best_dist:
+            best_dist = dist
+            best_nc   = entry["nc_path"]
+    return best_nc
+
+
+periodic_lookup = []
+if args.periodic_runs_dir is not None:
+    periodic_dir = os.path.abspath(args.periodic_runs_dir)
+    if not os.path.isdir(periodic_dir):
+        raise FileNotFoundError(f"--periodic_runs_dir not found: {periodic_dir}")
+    periodic_lookup = _build_periodic_lookup(periodic_dir)
+    if not periodic_lookup:
+        raise ValueError(f"No completed periodic members found in {periodic_dir}")
+    print(f"Periodic profile source: {periodic_dir}")
+    print(f"  Found {len(periodic_lookup)} completed member(s): "
+          + ", ".join(e["tag"] for e in periodic_lookup))
+    print()
 
 for path, label in [(template_file, "Template"), (topo_file, "Terrain file")]:
     if not os.path.isfile(path):
@@ -173,7 +272,11 @@ for i, met_dir in enumerate(dirs):
     os.makedirs(log_dir,    exist_ok=True)
 
     # -- Boundary planes (LAD inflow) -------------------------------------
-    bndys_base = generate_boundary_planes(icbc_dir, "FE_Bndys", ug, vg)
+    periodic_nc = _closest_periodic(periodic_lookup, ug, vg) if periodic_lookup else None
+    if periodic_nc:
+        print(f"    → using periodic profile from {os.path.basename(periodic_nc)}")
+    bndys_base = generate_boundary_planes(icbc_dir, "FE_Bndys", ug, vg,
+                                          periodic_nc=periodic_nc)
 
     # -- Initial condition file (required for hydroBCs=1 BC loading) ------
     ic_base = f"FE_Member{tag}"
@@ -258,8 +361,12 @@ truth_icbc_dir = os.path.join(truth_dir_path, "ICBC")
 os.makedirs(truth_output, exist_ok=True)
 os.makedirs(truth_log,    exist_ok=True)
 
+truth_periodic_nc = _closest_periodic(periodic_lookup, truth_ug, truth_vg) if periodic_lookup else None
+if truth_periodic_nc:
+    print(f"  truth → using periodic profile from {os.path.basename(truth_periodic_nc)}")
 truth_bndys_base = generate_boundary_planes(truth_icbc_dir, "FE_Bndys",
-                                             truth_ug, truth_vg)
+                                             truth_ug, truth_vg,
+                                             periodic_nc=truth_periodic_nc)
 
 if args.ic_template is not None:
     generate_ic(args.ic_template, truth_output, "FE_Membertruth.0",

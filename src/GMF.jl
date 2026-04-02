@@ -1,6 +1,6 @@
 # cgf cego6160@colorado.edu
 # Gaussian Mixture Filter for POD coefficient space
-
+using Distributions
 # structure definition
 struct GMFilter
     K       :: Int              # number of mixture components (one per ensemble member)

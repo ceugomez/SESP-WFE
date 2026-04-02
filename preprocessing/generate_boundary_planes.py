@@ -133,19 +133,75 @@ def _base_state(z: np.ndarray):
     return rho, theta
 
 
-def _write_one_file(filepath: str, Ug: float, Vg: float) -> None:
-    """Write a single boundary-plane NetCDF4 file for geostrophic inflow."""
-    z   = _cell_centers(NZ, DZ)
-    rho, theta = _base_state(z)
+def lad_profile_from_periodic(nc_path: str,
+                              target_ug: float, target_vg: float) -> dict:
+    """
+    Extract and rotate the horizontally-averaged LES profile from a periodic
+    FastEddy output file to match a target geostrophic wind direction.
 
-    # Vertical profiles for each field (shape: NZ)
-    profiles = {
-        "rho":   rho,
-        "u":     np.full(NZ, Ug),
-        "v":     np.full(NZ, Vg),
-        "w":     np.zeros(NZ),
-        "theta": theta,
+    The periodic run's horizontal mean captures the Ekman spiral, surface-layer
+    reduction, and stability structure that the model naturally produces —
+    far more physical than a uniform geostrophic profile.  The profile is
+    rotated (not rescaled) to align with the target member's wind direction,
+    preserving wind speed and BL depth.
+
+    Parameters
+    ----------
+    nc_path    : path to a late-time periodic FastEddy output NetCDF file
+    target_ug  : target zonal geostrophic wind (m/s)
+    target_vg  : target meridional geostrophic wind (m/s)
+
+    Returns
+    -------
+    dict with keys 'rho', 'u', 'v', 'w', 'theta' — 1-D arrays of length Nz
+    """
+    with nc.Dataset(nc_path) as ds:
+        # Horizontal mean over all (y, x) for each z level
+        u_src   = np.asarray(ds["u"][0]).mean(axis=(1, 2))
+        v_src   = np.asarray(ds["v"][0]).mean(axis=(1, 2))
+        rho     = np.asarray(ds["rho"][0]).mean(axis=(1, 2))
+        theta   = np.asarray(ds["theta"][0]).mean(axis=(1, 2))
+
+    # Infer source geostrophic direction from the top 5 levels (Rayleigh-damped
+    # toward geostrophic, so they are a reliable estimate).
+    ug_src = float(u_src[-5:].mean())
+    vg_src = float(v_src[-5:].mean())
+
+    # Rotation angle from source to target direction in the horizontal plane
+    angle_src    = np.arctan2(vg_src, ug_src)
+    angle_target = np.arctan2(target_vg, target_ug)
+    delta        = angle_target - angle_src
+
+    cos_d, sin_d = np.cos(delta), np.sin(delta)
+    u_rot = u_src * cos_d - v_src * sin_d
+    v_rot = u_src * sin_d + v_src * cos_d
+
+    return {
+        "rho":   rho.astype(np.float32),
+        "u":     u_rot.astype(np.float32),
+        "v":     v_rot.astype(np.float32),
+        "w":     np.zeros(len(u_src), dtype=np.float32),
+        "theta": theta.astype(np.float32),
     }
+
+
+def _write_one_file(filepath: str, Ug: float, Vg: float,
+                    profiles: dict = None) -> None:
+    """Write a single boundary-plane NetCDF4 file.
+
+    If *profiles* is given it is used directly (physics-based Ekman profile).
+    Otherwise falls back to a uniform geostrophic profile.
+    """
+    if profiles is None:
+        z   = _cell_centers(NZ, DZ)
+        rho, theta = _base_state(z)
+        profiles = {
+            "rho":   rho,
+            "u":     np.full(NZ, Ug),
+            "v":     np.full(NZ, Vg),
+            "w":     np.zeros(NZ),
+            "theta": theta,
+        }
 
     with nc.Dataset(filepath, "w", format="NETCDF4") as ds:
         ds.createDimension("time",   1)
@@ -179,25 +235,36 @@ def _write_one_file(filepath: str, Ug: float, Vg: float) -> None:
 
 
 def generate_boundary_planes(outdir: str, base: str,
-                              Ug: float, Vg: float) -> str:
+                              Ug: float, Vg: float,
+                              periodic_nc: str = None) -> str:
     """
     Generate the two boundary-plane files required for time-invariant LAD BCs.
 
     Parameters
     ----------
-    outdir : directory to write files into (created if absent)
-    base   : file basename (e.g. "FE_Bndys")
-    Ug     : zonal geostrophic wind component (m/s)
-    Vg     : meridional geostrophic wind component (m/s)
+    outdir      : directory to write files into (created if absent)
+    base        : file basename (e.g. "FE_Bndys")
+    Ug          : zonal geostrophic wind component (m/s) for this member
+    Vg          : meridional geostrophic wind component (m/s) for this member
+    periodic_nc : (optional) path to a late-time periodic FastEddy output file.
+                  When provided, the horizontally-averaged Ekman profile is
+                  extracted from this file and rotated to align with (Ug, Vg),
+                  producing physically consistent inflow BCs that eliminate
+                  the spurious Dirichlet-forcing artifacts seen with a uniform
+                  geostrophic profile.  Falls back to analytic if not given.
 
     Returns
     -------
     hydroBndysFileBase string to use in the namelist
     """
+    profiles = None
+    if periodic_nc is not None:
+        profiles = lad_profile_from_periodic(periodic_nc, Ug, Vg)
+
     os.makedirs(outdir, exist_ok=True)
     for idx in range(2):           # .0 and .1 — identical time-invariant pair
         filepath = os.path.join(outdir, f"{base}.{idx}")
-        _write_one_file(filepath, Ug, Vg)
+        _write_one_file(filepath, Ug, Vg, profiles=profiles)
     return os.path.join(outdir, base)
 
 

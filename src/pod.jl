@@ -13,7 +13,7 @@ using JLD2
 # PODBasis struct, includes all the stuff we need to do sequential estimation
 struct PODBasis
     coeffs        :: Matrix{Float32}   # (?,?) - POD modal coefficients for all timesteps. as (rows=modes, cols=timesteps)
-    modes         :: Matrix{Float32}   # (state_dim, L) — orthonormal POD modes ψ_k, where L is the number of
+    modes         :: Matrix{Float32}   # (state_dim, L) — orthonormal POD modes ψ_k
     eigenvalues   :: Vector{Float64}   # (L,) descending in magnitude
     L             :: Int
     n_snapshots   :: Int
@@ -137,4 +137,23 @@ function compute_pod(X::Matrix{Float32}, grid::GridInfo;
 
     @info "  POD complete: L=$L"
     return PODBasis(a, Φ, λ_L, L, N, grid)
+end
+
+# Reconstruct NCfield from POD basis and coefficient vector(s).
+# a_hat is (L,) for a single timestep or (L, T) for a time series.
+# Reconstruction: x = Φ * a_hat  (modes * coefficients → state vector)
+function reconstruct_from_pod(basis::PODBasis, a_hat::AbstractVecOrMat{<:Real},
+                               t::Vector{Float32}) :: NCfield
+    Φ = basis.modes                          # (state_dim, L)
+    X = Float32.(Φ * Float64.(a_hat))        # (state_dim, T)
+    T_len = size(X, 2)
+    grid  = basis.grid
+
+    u4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T_len)
+    v4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T_len)
+    w4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T_len)
+    for i in 1:T_len
+        u4[:,:,:,i], v4[:,:,:,i], w4[:,:,:,i] = unpack_snapshot(view(X, :, i), grid)
+    end
+    return NCfield(t, grid, u4, v4, w4)
 end

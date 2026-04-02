@@ -1,0 +1,15 @@
+- We need to get the prior on the coefficients from the ensemble. My recollection of the math is     
+that this is just an inner product between the field and the basis vectors...? Anyway, we need a     
+scalar coefficient value for each ensemble member and basis vector to initialize an equal-weight     
+prior Gaussian expectation.                                     
+(oh wait, apparently we have these - just need to select from the coefficient matrix)
+
+- We need to write some visualization codes, and with it some more data-handling codes.              
+Particularly, I need to be able to unpack the POD reconstruction of the field into a standard        
+gridded 3-d wind field, so that it's visualizable, and comparable. Then we should write some more    
+logic to display and maybe animate the outputs.                                                      
+- Then, we need to write some code to generate synthetic observations, probably in a different file. 
+                                                                                                     
+- THEN, and only then, can we start thinking about actually doing sequential data assimilation.      
+Any thoughts? I am always open to general thoughts, thoughts on the merits of the work, thoughts on  
+the mathematical rigor, OR thoughts on the organizational structure. 
