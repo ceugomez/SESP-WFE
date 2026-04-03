@@ -30,6 +30,22 @@ truth_field = reconstruct_NCfield(truth_field_squish, encfg.truth_member, grid)
 
 
 
+# ------------------------------------------ POD reconstruction floor check -------------------------------------------
+# Project truth snapshot onto basis and reconstruct — gives the irreducible error floor from POD truncation.
+# The filter cannot beat this number; if filter RMSE ≈ this value, the filter has converged optimally.
+pod_truth_tidx = 25
+truth_state = Float32[vec(truth_field.u[:,:,:,pod_truth_tidx]);
+                      vec(truth_field.v[:,:,:,pod_truth_tidx]);
+                      vec(truth_field.w[:,:,:,pod_truth_tidx])]
+truth_coeffs_proj  = basis.modes' * truth_state          # project onto basis
+truth_reconstructed = basis.modes * truth_coeffs_proj    # reconstruct from truncated basis
+pod_rmse = sqrt(mean((truth_reconstructed .- truth_state).^2))
+pod_max_err = maximum(abs.(truth_reconstructed .- truth_state))
+@info "POD reconstruction floor (L=$(basis.L) modes): RMSE = $(round(pod_rmse, digits=4)) m/s  |  max abs error = $(round(pod_max_err, digits=4)) m/s"
+
+
 # Deliverable Level 1- Estimation of a static field from sparse measurements, say 10 agents
 max_iter = 100
 filter_history = runtime_loop(truth_field, basis, prior, max_iter)
+truth_coeffs_plot = basis.modes' * truth_state   # (L,) projected truth coefficients for plotting
+plot_gaussian_mixture_ridgeline.(Ref(filter_history), 1:10, Ref(truth_coeffs_plot))

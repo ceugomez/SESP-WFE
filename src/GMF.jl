@@ -9,9 +9,9 @@ include(joinpath(WORKDIR, "measurement.jl"))
 struct GMFilter
     K       :: Int              # number of mixture components (one per ensemble member)
     L       :: Int              # number of POD modes
-    weights :: Vector{Float32}  # length K, sum to 1
+    weights :: Vector{Float64}  # length K, sum to 1
     means   :: Matrix{Float32}  # K × L
-    vars    :: Matrix{Float32}  # K × L (diagonal covariance assumption)
+    covs    :: Array{Float32,3} # K × L × L, full per-component covariance matrices
 end
 
 # Initialize equal-weight GMF prior from POD basis.
@@ -31,18 +31,18 @@ function init_prior(basis::PODBasis, M::Int) :: GMFilter    # Equation 4
     @assert T * M == N "N=$N is not evenly divisible by M=$M"
 
     means = Matrix{Float32}(undef, M, L)
-    vars  = Matrix{Float32}(undef, M, L)
+    covs  = zeros(Float32, M, L, L)
 
     for m in 1:M
         cols = (m-1)*T+1 : m*T                     # this member's timestep columns
         a_m  = basis.coeffs[:, cols]                # (L, T)
         means[m, :] = vec(mean(a_m, dims=2))        # temporal mean per mode
-        vars[m, :]  = vec(var(a_m, dims=2))         # temporal variance per mode
+        covs[m, :, :] = Float32.(cov(Float64.(a_m), dims=2))  # full L×L sample covariance
     end
 
-    weights = fill(Float32(1/M), M)     # equal weight given to each ensemble member for now
+    weights = fill(1.0/M, M)            # equal weight given to each ensemble member for now
 
-    return GMFilter(M, L, weights, means, vars) # return a Gaussian Mixture Filter with one Gaussian (mean and variance) per ensemble member
+    return GMFilter(M, L, weights, means, covs)
 end
 
 
@@ -53,16 +53,23 @@ function runtime_loop(truth_field::NCfield, basis::PODBasis, prior::GMFilter, ma
     # pr - Gaussian mixture prior over coefficients
     #   - Predicted obs: ŷ_k = H * μ_k
     #   - Innovation: ν_k = Y - ŷ_k
-    #   - Innovation covariance: S_k = H * Σ_k * H' + R (Σ_k is diagonal from vars[k,:])
+    #   - Innovation covariance: S_k = H * Σ_k * H' + R (Σ_k is full L×L per-component covariance)
     #   - Kalman gain: K_k = Σ_k * H' * inv(S_k)
     #   - Updated mean: μ_k⁺ = μ_k + K_k * ν_k
     #   - Updated covariance: Σ_k⁺ = (I - K_k * H) * Σ_k
     #   - Updated weight: w_k⁺ ∝ w_k * 𝒩(Y; ŷ_k, S_k) — this is the likelihood of the observation under component k
     println("Initializing GM Filter...")
     truth_tidx = 25         # Always keep the truth field at the same timestep (truth field has 53 snapshots)
-    n_measurements = 20;    # 20 observations
+    n_measurements = 3;    # 3 observations
     measurement_variance = diagm(Float32[0.01, 0.01, 0.001])  # uncorrelated noise in each component of the wind direction
     n_components = prior.K  # number of components in each gaussian mixture (same as no. of ensemble members)
+
+    # project truth snapshot into coefficient space for RMSE diagnostics
+    u_snap = vec(truth_field.u[:,:,:,truth_tidx])
+    v_snap = vec(truth_field.v[:,:,:,truth_tidx])
+    w_snap = vec(truth_field.w[:,:,:,truth_tidx])
+    truth_state = Float32[u_snap; v_snap; w_snap]                   # (state_dim,) ground truth state vector
+    truth_coeffs = basis.modes' * truth_state                       # (L,) — kept for reference, not used in diagnostics
 
     gm = [prior]    # make a vector of loops
     # Run the loop N times, assimilating new observations each time
@@ -71,13 +78,14 @@ function runtime_loop(truth_field::NCfield, basis::PODBasis, prior::GMFilter, ma
         measurement_locations = randLocsInBounds(grid, n_measurements)               # sample n_meas random locations from the grid
         measurements = get_measurement_set(truth_field, grid, measurement_locations, measurement_variance, truth_tidx)  # sample n_measurements from truth_field with noise 
         Y = vcat([m.val for m in measurements.measurements]...)                     # stack 'em
-        # get H matrix for measurement set 
+        # get H matrix for measurement set
         H = make_H_matrix(basis, measurements)
+        R_meas = kron(I(n_measurements), measurement_variance)   # measurement noise covariance (3n_meas × 3n_meas)
         # preallocate
         mean_update = Vector{Vector{Float32}}()
-        var_update = Vector{Vector{Float32}}()
-        raw_weights = Vector{Float32}()
-        
+        cov_update  = Vector{Matrix{Float32}}()
+        raw_weights = Vector{Float64}()
+
         # Kalman update loop, for all components
         for j in 1:n_components
             # get predicted measurements
@@ -86,29 +94,44 @@ function runtime_loop(truth_field::NCfield, basis::PODBasis, prior::GMFilter, ma
             # compute innovation
             # ν_k = Y - ŷ_k
             innov = Y - predicted_measurements   # difference btwn predicted and observed
-            # get current covariance in coefficient space
-            #
-            Sigma_j = diagm(gm[i].vars[j, :])      
-            # get innovation of covariance                                                                                                                                                                    
+            # full per-component covariance
+            Sigma_j = gm[i].covs[j, :, :]
+            # get innovation covariance
+            # S_k = H * Σ_k * H' + R
             innov_cov = H * Sigma_j * H' + kron(I(n_measurements), measurement_variance)
             innov_cov = (innov_cov + innov_cov') / 2   # symmetrize to correct Float32 rounding
-            # compute kalman gain, 
-            # K_k = Σ_k * H' * inv(S_k)                                                                                                                        
+            # compute kalman gain
+            # K_k = Σ_k * H' * inv(S_k)
             Kgain = Sigma_j * H' * inv(innov_cov)
-            # update the means 
-            #μ_k⁺ = μ_k + K_k * ν_k
-            push!(mean_update, gm[i].means[j,:] + Kgain * innov)                # updated mean
-            # update the variance
-            # Σ_k⁺ = (I - K_k * H) * Σ_k
-            push!(var_update,  diag((I - Kgain * H) * Sigma_j))         # update covariance
-            # update the weights for each component
-            likelihood = pdf(MvNormal(predicted_measurements, innov_cov), Y) 
-            push!(raw_weights, gm[i].weights[j] * likelihood)
+            # update the means
+            # μ_k⁺ = μ_k + K_k * ν_k
+            push!(mean_update, gm[i].means[j,:] + Kgain * innov)
+            # update the full covariance via Joseph form for numerical stability
+            # Σ_k⁺ = (I - K_k * H) * Σ_k * (I - K_k * H)ᵀ + K_k * R * K_kᵀ
+            # guaranteed positive semi-definite regardless of floating point errors
+            IKH = I - Kgain * H
+            Sigma_j_new = Float32.(IKH * Sigma_j * IKH' + Kgain * R_meas * Kgain')
+            push!(cov_update, Sigma_j_new)
+            # update the weights for each component (log-space to avoid underflow in high dimensions)
+            log_likelihood = logpdf(MvNormal(predicted_measurements, innov_cov), Y)
+            push!(raw_weights, log(gm[i].weights[j]) + log_likelihood)
         end
-        mean_update = reduce(hcat, mean_update)'
-        var_update = reduce(hcat, var_update)'  # stack 'em
-        new_weights = raw_weights ./ sum(raw_weights)   # normalize weights
-        push!(gm, GMFilter(gm[i].K, gm[i].L, new_weights, mean_update, var_update))     # push new GMfilter to the array
+        mean_update_mat = reduce(hcat, mean_update)'                        # K × L
+        cov_update_arr  = stack(cov_update, dims=1)                         # K × L × L
+        log_w = raw_weights .- maximum(raw_weights)     # log-sum-exp: shift for numerical stability
+        new_weights = exp.(log_w) ./ sum(exp.(log_w))   # normalize weights
+        push!(gm, GMFilter(gm[i].K, gm[i].L, new_weights, mean_update_mat, cov_update_arr))
+
+        # diagnostics
+        mean_update = mean_update_mat
+        post_mean        = vec(new_weights' * mean_update)              # weighted mean over components (L,)
+        mean_spread = sum(new_weights[j] * sum((mean_update[j, :] .- post_mean).^2) for j in 1:n_components)
+        # total posterior variance: weighted sum of component traces plus spread of means
+        total_var = sum(new_weights[j] * tr(cov_update_arr[j, :, :]) for j in 1:n_components) + mean_spread
+        reconstructed    = basis.modes * post_mean                      # (state_dim,) reconstructed wind field
+        field_rmse       = sqrt(mean((reconstructed .- truth_state).^2))  # RMSE in m/s
+        field_max_abs_error = maximum(abs.(reconstructed .- truth_state))
+        @info "iter $i / $max_iter  |  total var: $(round(total_var, digits=4))  |  field RMSE: $(round(field_rmse, digits=4)) m/s | max abs error: $(round(field_max_abs_error,digits=4)) m/s"
     end
     return gm
 end
