@@ -6,6 +6,9 @@ using Distributions, Plots, StatsPlots
 #TBD TBD TBD TBD
 # should really have: 1 to plot gaussian mixture, 1 to plot x/z and x/y mode shape 
 
+# 3-d plot of gaussian mixture posterior, with x as coefficient value, y aS 
+
+
 # ascii_slice display wind field 
 function ascii_slice(field::NCfield, t_idx::Int; plane::Symbol=:xy, fixed_idx::Int=1,
                        width::Int=60, height::Int=20)                                  

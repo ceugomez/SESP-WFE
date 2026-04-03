@@ -29,23 +29,7 @@ truth_field_squish = load_member_snapshots(encfg.truth_member)
 truth_field = reconstruct_NCfield(truth_field_squish, encfg.truth_member, grid)
 
 
-# construct measurement relation
-loc1 = Float32[3.5, 4.2, 0.05]   # is location in m or km? trying for 3.5 km, 4.2 km, 50 m.
-loc2 = Float32[0.1, 0.1, 0.05]
-#meas_set = get_measurement_set()
-meas_obj = get_scalar_measurement(truth_field, grid, loc1, diagm(Float32[0.01, 0.01, 0.0]), 2)
-H = make_H_matrix(basis, measSet([meas_obj]))
 
-
-
-
-
-
-#  The Bayesian update (core of the filter) — one pass per component k:
-#   - Predicted obs: ŷ_k = H * μ_k
-#   - Innovation: ν_k = Y - ŷ_k
-#   - Innovation covariance: S_k = H * Σ_k * H' + R (Σ_k is diagonal from vars[k,:])
-#   - Kalman gain: K_k = Σ_k * H' * inv(S_k)
-#   - Updated mean: μ_k⁺ = μ_k + K_k * ν_k
-#   - Updated covariance: Σ_k⁺ = (I - K_k * H) * Σ_k
-#   - Updated weight: w_k⁺ ∝ w_k * 𝒩(Y; ŷ_k, S_k) — this is the likelihood of the observation under component k
+# Deliverable Level 1- Estimation of a static field from sparse measurements, say 10 agents
+max_iter = 100
+filter_history = runtime_loop(truth_field, basis, prior, max_iter)
