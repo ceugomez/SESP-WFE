@@ -2,6 +2,7 @@
 # Gaussian Mixture Filter for POD coefficient space
 using Distributions
 include(joinpath(WORKDIR, "pod.jl"))            # POD utilities
+include(joinpath(WORKDIR, "measurement.jl"))
 # structure definition
 struct GMFilter
     K       :: Int              # number of mixture components (one per ensemble member)
@@ -39,6 +40,15 @@ function init_prior(basis::PODBasis, M::Int) :: GMFilter
 
     weights = fill(Float32(1/M), M)     # equal weight given to each ensemble member for now
 
-    return GMFilter(M, L, weights, means, vars) # sum of gaussian with mean and variance for each 
+    return GMFilter(M, L, weights, means, vars) # return a Gaussian Mixture Filter with one Gaussian (mean and variance) per ensemble member
 end
+function runtime_loop(basis::PODbasis, M::Int)
 
+
+
+
+
+
+function randLocInBounds(grid::GridInfo, n::Int)::Vector{Float32}
+    # get a random location in bounds (not done, obvi)
+end
