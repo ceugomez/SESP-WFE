@@ -53,8 +53,8 @@ function plot_gaussian_mixture(g::GMFilter, coeff_idx::Int=1)
     @info("GMFilter: K=$(g.K) components, L=$(g.L) modes")
     @info("  weights: $(g.weights)")
     @info("  means[:, $(coeff_idx)]:  $(g.means[:, coeff_idx])")
-    @info("  vars[:, $(coeff_idx)]:   $([g.covs[k, coeff_idx, coeff_idx] for k in 1:g.K])")
-    components = [Normal(g.means[k, coeff_idx], sqrt(g.covs[k, coeff_idx, coeff_idx])) for k in 1:g.K]
+    @info("  vars[:, $(coeff_idx)]:   $([g.vars[k, coeff_idx] for k in 1:g.K])")
+    components = [Normal(g.means[k, coeff_idx], sqrt(g.vars[k, coeff_idx])) for k in 1:g.K]
     mixture = MixtureModel(components, g.weights)
     plot(mixture,
          components=false,
@@ -93,7 +93,7 @@ function plot_gaussian_mixture_ridgeline(gvec::Vector{GMFilter}, coeff_idx::Int,
              yticks=0:10:length(gvec))
     for t in 1:downsample:length(gvec)
         g = gvec[t]
-        components = [Normal(g.means[k, coeff_idx], sqrt(g.covs[k, coeff_idx, coeff_idx])) for k in 1:g.K]
+        components = [Normal(g.means[k, coeff_idx], sqrt(g.vars[k, coeff_idx])) for k in 1:g.K]
         mixture = MixtureModel(components, g.weights)
 
         # calc & normalize pdf
@@ -123,5 +123,57 @@ function plot_gaussian_mixture_ridgeline(gvec::Vector{GMFilter}, coeff_idx::Int,
     return p
 end
 
-function plot_reconstruction_field_error_over_time(gvec::Vector{GMFilter}, truth_field::NCfield)
+function plot_field_reconstruction(gm_final::GMFilter, basis::PODBasis, truth_field::NCfield, truth_tidx::Int;
+                                   y_idx::Int=-1)
+    grid = basis.grid
+    iy = y_idx > 0 ? y_idx : grid.Ny ÷ 2   # default: mid-y xz slice
+
+    # posterior mean coefficients → reconstructed state vector → u field
+    post_mean     = vec(gm_final.weights' * gm_final.means)             # (L,)
+    recon_state   = basis.modes * post_mean                             # (state_dim,)
+    n             = grid.n_grid
+    recon_u       = reshape(recon_state[1:n],       grid.Nx, grid.Ny, grid.Nz)
+    recon_v       = reshape(recon_state[n+1:2n],    grid.Nx, grid.Ny, grid.Nz)
+    recon_w       = reshape(recon_state[2n+1:3n],   grid.Nx, grid.Ny, grid.Nz)
+
+    truth_u = truth_field.u[:, :, :, truth_tidx]
+    truth_v = truth_field.v[:, :, :, truth_tidx]
+    truth_w = truth_field.w[:, :, :, truth_tidx]
+
+    # xz slices at mid-y
+    truth_spd  = sqrt.(truth_u[:, iy, :].^2 .+ truth_v[:, iy, :].^2)
+    recon_spd  = sqrt.(recon_u[:, iy, :].^2 .+ recon_v[:, iy, :].^2)
+    error_u    = recon_u[:, iy, :] .- truth_u[:, iy, :]    # signed error in u
+
+    # between-component uncertainty: weighted std dev of reconstructed u across components
+    comp_u = zeros(Float32, grid.Nx, grid.Nz, gm_final.K)
+    for k in 1:gm_final.K
+        state_k = basis.modes * gm_final.means[k, :]
+        comp_u[:, :, k] = reshape(state_k[1:n], grid.Nx, grid.Ny, grid.Nz)[:, iy, :]
+    end
+    mean_u_field = sum(gm_final.weights[k] .* comp_u[:, :, k] for k in 1:gm_final.K)
+    uncert_u     = sqrt.(sum(gm_final.weights[k] .* (comp_u[:, :, k] .- mean_u_field).^2
+                             for k in 1:gm_final.K))
+
+    # x and z axes for plotting (km)
+    x_km = grid.xPos[:, iy, 1] ./ 1000
+    z_km = grid.zPos[grid.Nx÷2, iy, :] ./ 1000
+
+    spd_lim  = maximum(truth_spd)
+    err_lim  = maximum(abs.(error_u))
+    unc_lim  = maximum(uncert_u)
+
+    p1 = heatmap(x_km, z_km, truth_spd',  clims=(0, spd_lim), color=:viridis,
+                 title="Truth wind speed", xlabel="x (km)", ylabel="z (km)")
+    p2 = heatmap(x_km, z_km, recon_spd',  clims=(0, spd_lim), color=:viridis,
+                 title="Posterior mean wind speed", xlabel="x (km)", ylabel="z (km)")
+    p3 = heatmap(x_km, z_km, error_u',    clims=(-err_lim, err_lim), color=:RdBu,
+                 title="Error in u  (recon − truth)", xlabel="x (km)", ylabel="z (km)")
+    p4 = heatmap(x_km, z_km, uncert_u',   clims=(0, unc_lim), color=:plasma,
+                 title="Uncertainty in u  (between-component σ)", xlabel="x (km)", ylabel="z (km)")
+
+    p = plot(p1, p2, p3, p4, layout=(2, 2), size=(1200, 800), dpi=150)
+    savefig(p, "/home/cego6160/workspace/prediction/output/field_reconstruction.png")
+    @info "Saved field_reconstruction.png"
+    return p
 end

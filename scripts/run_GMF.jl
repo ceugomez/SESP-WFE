@@ -49,3 +49,4 @@ max_iter = 100
 filter_history = runtime_loop(truth_field, basis, prior, max_iter)
 truth_coeffs_plot = basis.modes' * truth_state   # (L,) projected truth coefficients for plotting
 plot_gaussian_mixture_ridgeline.(Ref(filter_history), 1:10, Ref(truth_coeffs_plot))
+plot_field_reconstruction(filter_history[end], basis, truth_field, 25)
