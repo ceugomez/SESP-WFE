@@ -3,7 +3,7 @@
 using LinearAlgebra
 
 # ---- Configuration ----
-const CONFIG_PATH  = "/home/cego6160/workspace/runs/ensemble_config.json"
+const CONFIG_PATH  = "/home/cego6160/workspace/runs_lad/ensemble_config.json"
 const WORKDIR      = "/home/cego6160/workspace/prediction/src"
 const OUTPUT_DIR   = "/home/cego6160/workspace/prediction/output"
 const L            = 50          # number of POD modes to retain

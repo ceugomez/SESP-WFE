@@ -15,6 +15,14 @@ struct measSet
 	measurements::Vector{meas}    # set of measurements
 end
 
+# set of measurements for every timestep 
+function get_measurement_sequence(U::NCfield, grid::GridInfo,  nm::Int, mvar::Matrix{Float32}, tidx::Vector{Int})::Vector{measSet}
+	# samples a set of nm measurements across the U truth field 
+	# for every timestep in tidx [constant for phase 1, sequential for phase 2]
+	return [get_measurement_set(U, grid, randLocsInBounds(grid, nm), mvar, t) for t in tidx]   
+end
+
+
 # takes a scalar measurement from the field at a continous position 
 function get_scalar_measurement(U::NCfield, grid::GridInfo, loc::Vector{Float32}, var::Matrix{Float32}, tidx::Int)::meas
 	# as below, 
@@ -26,7 +34,7 @@ function get_scalar_measurement(U::NCfield, grid::GridInfo, loc::Vector{Float32}
 	val = Float32[U.u[locidx[1], locidx[2], locidx[3], tidx],
 		U.v[locidx[1], locidx[2], locidx[3], tidx],
 		U.w[locidx[1], locidx[2], locidx[3], tidx]]
-	val = val + randn(Float32, 3) .* sqrt.(diag(var));     # measurement + (uncorrelated, but different) noise
+	val = val + randn(Float32, 3) .* sqrt.(diag(var))     # measurement + (uncorrelated, but different) noise
 	return meas(loc, locidx, val)
 end
 
@@ -53,6 +61,36 @@ function randLocsInBounds(grid::GridInfo, n::Int)::Vector{Vector{Float32}}
 	return [randLocInBounds(grid) for _ in 1:n]
 end
 
+
+# Generate a flight-track measurement sequence: n_vehicles vehicles wander
+# through the domain as correlated random walks, producing one measurement
+# per vehicle per timestep.
+#   step_frac : fraction of domain extent to move per timestep (default 0.1)
+function get_flighttrack_sequence(U::NCfield, grid::GridInfo, n_vehicles::Int,
+                                  mvar::Matrix{Float32}, tidx::Vector{Int};
+                                  step_frac::Float64=0.1)::Vector{measSet}
+    Xext = grid.Nx * grid.dx
+    Yext = grid.Ny * grid.dy
+    step_xy = Float32(step_frac * max(Xext, Yext))
+
+    # initialize vehicle positions randomly
+    positions = [randLocInBounds(grid) for _ in 1:n_vehicles]
+
+    seq = Vector{measSet}(undef, length(tidx))
+    for (i, t) in enumerate(tidx)
+        # take measurements at current positions
+        seq[i] = get_measurement_set(U, grid, positions, mvar, t)
+        # advance each vehicle with a random-walk step, clamped to domain
+        for v in 1:n_vehicles
+            dx = randn(Float32) * step_xy
+            dy = randn(Float32) * step_xy
+            new_x = clamp(positions[v][1] + dx, 0f0, Float32(Xext - grid.dx))
+            new_y = clamp(positions[v][2] + dy, 0f0, Float32(Yext - grid.dy))
+            positions[v] = Float32[new_x, new_y, positions[v][3]]  # hold altitude
+        end
+    end
+    return seq
+end
 
 # Helper functions
 function idx2loc(locidx::Vector{Int}, grid::GridInfo)::Vector{Float32}
