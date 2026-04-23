@@ -38,12 +38,12 @@ function get_scalar_measurement(U::NCfield, grid::GridInfo, loc::Vector{Float32}
 	return meas(loc, locidx, val)
 end
 
+# get a set of measurements given locations and variance at time index tidx
 function get_measurement_set(U::NCfield, grid::GridInfo, locs::Vector{Vector{Float32}}, var::Matrix{Float32}, tidx::Int)::measSet
 	# get a set of measurements given locations and variance at time index tidx
 	m = [get_scalar_measurement(U, grid, loc, var, tidx) for loc in locs]
 	return measSet(m)
 end
-
 
 # get a uniformly random location in the grid, in continuous space
 function randLocInBounds(grid::GridInfo)::Vector{Float32}
@@ -53,7 +53,7 @@ function randLocInBounds(grid::GridInfo)::Vector{Float32}
 	randX = rand(Uniform(0, Xextent))
 	randY = rand(Uniform(0, Yextent))
 	randZidx = rand(4:grid.Nz)
-	randZ = grid.zPos[randZidx]
+	randZ = grid.zPos[grid.Nx÷2, grid.Ny÷2, randZidx]
 	return Float32[randX, randY, randZ]
 end
 # get a set of uniformly distributed random locations in the grid 
@@ -65,28 +65,33 @@ end
 # Generate a flight-track measurement sequence: n_vehicles vehicles wander
 # through the domain as correlated random walks, producing one measurement
 # per vehicle per timestep.
-#   step_frac : fraction of domain extent to move per timestep (default 0.1)
+#   step_frac : fraction of domain extent to move per timestep 
 function get_flighttrack_sequence(U::NCfield, grid::GridInfo, n_vehicles::Int,
                                   mvar::Matrix{Float32}, tidx::Vector{Int};
                                   step_frac::Float64=0.1)::Vector{measSet}
-    Xext = grid.Nx * grid.dx
-    Yext = grid.Ny * grid.dy
+    Xext    = grid.Nx * grid.dx
+    Yext    = grid.Ny * grid.dy
     step_xy = Float32(step_frac * max(Xext, Yext))
 
-    # initialize vehicle positions randomly
+    # z extent in physical space at domain centre; step is same fraction
+    z_all   = grid.zPos[grid.Nx÷2, grid.Ny÷2, :]
+    z_lo    = z_all[4]          # keep vehicles above near-surface levels
+    z_hi    = z_all[end]
+    step_z  = Float32(step_frac * (z_hi - z_lo))
+
     positions = [randLocInBounds(grid) for _ in 1:n_vehicles]
 
     seq = Vector{measSet}(undef, length(tidx))
     for (i, t) in enumerate(tidx)
-        # take measurements at current positions
         seq[i] = get_measurement_set(U, grid, positions, mvar, t)
-        # advance each vehicle with a random-walk step, clamped to domain
         for v in 1:n_vehicles
-            dx = randn(Float32) * step_xy
-            dy = randn(Float32) * step_xy
-            new_x = clamp(positions[v][1] + dx, 0f0, Float32(Xext - grid.dx))
-            new_y = clamp(positions[v][2] + dy, 0f0, Float32(Yext - grid.dy))
-            positions[v] = Float32[new_x, new_y, positions[v][3]]  # hold altitude
+            dx    = randn(Float32) * step_xy
+            dy    = randn(Float32) * step_xy
+            dz    = randn(Float32) * step_z
+            new_x = clamp(positions[v][1] + dx, 0f0,  Float32(Xext - grid.dx))
+            new_y = clamp(positions[v][2] + dy, 0f0,  Float32(Yext - grid.dy))
+            new_z = clamp(positions[v][3] + dz, z_lo, z_hi)
+            positions[v] = Float32[new_x, new_y, new_z]
         end
     end
     return seq

@@ -60,38 +60,46 @@ end
 # Compare GMF, KF, and LS estimators over a sequence of timesteps.
 # tidx_seq: truth snapshot index for each assimilation step (length == number of steps).
 #           Pass fill(tidx, n) for a static field or collect(1:n) for a dynamic one.
+# Y: measurement sequence — LS is re-solved at each step using only Y[1:i].
+# GMF point estimate is the MAP (mean of the highest-weight component).
+# Optional gmfr_history: resampled GMF history (variable-K GMFilter vector).
 function compare_estimators(filter_history::Vector{GMFilter},
                             kf_history::Vector{Tuple{Vector{Float64}, Vector{Float64}}},
-                            α_ls::Vector{Float64},
                             basis::PODBasis, truth_field::NCfield,
-                            tidx_seq::Vector{Int})
+                            tidx_seq::Vector{Int}, Y::Vector{measSet};
+                            gmfr_history::Union{Vector{GMFilter}, Nothing}=nothing)
     n = length(tidx_seq)
-    rmse_gmf = Vector{Float64}(undef, n)
-    rmse_kf  = Vector{Float64}(undef, n)
-    rmse_ls  = Vector{Float64}(undef, n)
+    rmse_gmf  = Vector{Float64}(undef, n)
+    rmse_kf   = Vector{Float64}(undef, n)
+    rmse_ls   = Vector{Float64}(undef, n)
+    rmse_gmfr = isnothing(gmfr_history) ? nothing : Vector{Float64}(undef, n)
 
     for (i, tidx) in enumerate(tidx_seq)
         truth = get_truth_state(truth_field, tidx)
 
-        # GMF posterior mean at step i (filter_history[1] is prior, so step i → index i+1)
+        # GMF MAP at step i: mean of the dominant (highest-weight) component
         gm = filter_history[i+1]
-        α_gmf = vec(Float64.(gm.weights' * gm.means))
+        α_gmf = vec(Float64.(gm.means[argmax(gm.weights), :]))
         rmse_gmf[i], _ = field_errors(basis.modes * Float32.(α_gmf), truth)
 
         # KF posterior mean at step i
         α_kf_i = kf_history[i+1][1]
         rmse_kf[i], _  = field_errors(basis.modes * Float32.(α_kf_i), truth)
 
-        # LS is time-invariant: same estimate at every step
-        rmse_ls[i], _  = field_errors(basis.modes * Float32.(α_ls), truth)
+        # LS sequential: solve with only measurements available up to step i
+        α_ls_i = leastsquares(basis, Y[1:i])
+        rmse_ls[i], _  = field_errors(basis.modes * Float32.(α_ls_i), truth)
+
+        # Resampled GMF (if provided)
+        if !isnothing(gmfr_history)
+            gm_r = gmfr_history[i+1]
+            α_gmfr = vec(Float64.(gm_r.means[argmax(gm_r.weights), :]))
+            rmse_gmfr[i], _ = field_errors(basis.modes * Float32.(α_gmfr), truth)
+        end
     end
 
-    @info "Final RMSE — GMF: $(round(rmse_gmf[end], digits=4)) | KF: $(round(rmse_kf[end], digits=4)) | LS: $(round(rmse_ls[end], digits=4)) m/s"
-    @info "GMF weight distribution (top 5): $(sort(filter_history[end].weights, rev=true)[1:min(5,length(filter_history[end].weights))])"
+    @info "Final RMSE — GMF: $(round(rmse_gmf[end], digits=4)) | KF: $(round(rmse_kf[end], digits=4)) | LS: $(round(rmse_ls[end], digits=4))" *
+          (isnothing(rmse_gmfr) ? "" : " | GMFR: $(round(rmse_gmfr[end], digits=4))") * " m/s"
 
-    truth_coeffs = basis.modes' * get_truth_state(truth_field, tidx_seq[1])
-    dists = [norm(filter_history[1].means[j,:] .- truth_coeffs) for j in 1:filter_history[1].K]
-    @info "Prior distances to truth: min=$(minimum(dists)), winning component=$(argmin(dists))"
-
-    return rmse_gmf, rmse_kf, rmse_ls
+    return rmse_gmf, rmse_kf, rmse_ls, rmse_gmfr
 end

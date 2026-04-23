@@ -16,7 +16,7 @@ prior       = init_prior(basis, encfg.n_members)
 
 # ── POD reconstruction floor ──────────────────────────────────────────────────
 # Irreducible error from basis truncation — filter cannot beat this
-truth_tidx = 1
+truth_tidx = 2
 truth_state  = get_truth_state(truth_field, truth_tidx)
 truth_coeffs = basis.modes' * truth_state
 pod_rmse = sqrt(mean((basis.modes * truth_coeffs .- truth_state).^2))
@@ -28,11 +28,10 @@ max_iter = 50                               # run 50 timesteps
 num_measurements = 2                        # 1 sensors in the environment 
 mvar = diagm(Float32[0.1, 0.1, 0.1])     # sensor noise characteristics
 tidx_seq = fill(truth_tidx, max_iter)       # static field — same snapshot every iter
-Y =  get_flighttrack_sequence(truth_field, grid, 2, mvar, tidx_seq, step_frac=0.1)   #get_measurement_sequence(truth_field, grid, num_measurements, mvar, tidx_seq)  
+Y =  get_flighttrack_sequence(truth_field, grid, 2, mvar, tidx_seq, step_frac=0.05)   #get_measurement_sequence(truth_field, grid, num_measurements, mvar, tidx_seq)  
 filter_history = runtime_loop(basis, prior, Y, mvar)
-ζ_ls = leastsquares(basis, Y)
 kf_history = kf(basis, prior, Y, mvar)
-rmse_gmf, rmse_kf, rmse_ls = compare_estimators(filter_history, kf_history, ζ_ls, basis, truth_field, tidx_seq)
+rmse_gmf, rmse_kf, rmse_ls = compare_estimators(filter_history, kf_history, basis, truth_field, tidx_seq, Y)[1:3]
 
 
 #  ── Level 2: Dynamic field estimation ─────────────────────────────────────────
@@ -44,16 +43,15 @@ Y_dyn           =  get_flighttrack_sequence(truth_field, grid, 2, mvar, tidx_seq
 Q               = diagm(vec(mean(prior.vars, dims=1)) .* 0.01)
 filter_hist_dyn = runtime_loop(basis, prior, Y_dyn, mvar, Q)
 kf_hist_dyn     = kf(basis, prior, Y_dyn, mvar, Q)
-ζ_ls_dyn        = leastsquares(basis, Y_dyn)
-rmse_gmf_dyn, rmse_kf_dyn, rmse_ls_dyn = compare_estimators(filter_hist_dyn, kf_hist_dyn, ζ_ls_dyn, basis, truth_field, tidx_seq_dyn)
+rmse_gmf_dyn, rmse_kf_dyn, rmse_ls_dyn = compare_estimators(filter_hist_dyn, kf_hist_dyn, basis, truth_field, tidx_seq_dyn, Y_dyn)[1:3]
 
 # ── Visualization & evaluation ────────────────────────────────────────────────
 @info "plotting"
 for i in 1:10
     plot_gaussian_mixture(prior, i, truth_val=truth_coeffs[i])
 end
-#plot_gaussian_mixture_ridgeline.(Ref(filter_history), 1:10, Ref(truth_coeffs))
-#plot_field_reconstruction(filter_history[end], basis, truth_field, truth_tidx)
+plot_gaussian_mixture_ridgeline.(Ref(filter_history), 1:10, Ref(truth_coeffs))
+plot_field_reconstruction(filter_history[end], basis, truth_field, truth_tidx)
 
 # ── Level 1 animation ────────────────────────────────────────────────────────
 @info "saving L1 filter history for animation"
