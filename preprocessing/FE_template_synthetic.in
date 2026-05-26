@@ -1,0 +1,109 @@
+Description = Idealised complex-terrain neutral ABL ensemble member. Gaussian LHS over N(mu_dir, sigma_dir) x N(mu_spd, sigma_spd). Domain 506x506x162 at 10m. Steep ridge+knoll (~26 deg max slope), periodic recycled inflow.
+#--MPI_AALES
+numProcsX = 1
+numProcsY = 1
+#--CUDA_AALES
+tBx = 8   # (378+6=384 = 8*48) ✓
+tBy = 8
+tBz = 4   # (162+6=168 = 4*42) ✓
+#--IO
+inPath     = INPATH_PLACEHOLDER
+inFile     = INFILE_PLACEHOLDER
+outPath    = OUTPATH_PLACEHOLDER
+outFileBase = FE_MemberMEMBER_PLACEHOLDER
+frqOutput  = 7500       # every 75s at dt=0.01 (~1.25 min)
+ioOutputMode = 0
+#--GRID
+Nx = 378            # 3780 m at dx=10 m; (378+6)=384=8*48 ✓
+Ny = 378            # 3780 m at dy=10 m
+Nz = 82             # (82+6)=88=4*22 ✓; domain top ~600 m
+Nh = 3
+d_xi   = 10.0
+d_eta  = 10.0
+d_zeta = 10.0
+coordHorizHalos     = 0
+topoFile            = TOPOFILE_PLACEHOLDER
+verticalDeformSwitch    = 1     # terrain-following sigma coords
+verticalDeformFactor    = 0.78  # increased from 0.65 to resolve steep ~26 deg slopes
+verticalDeformQuadCoeff = 0.0
+#--TIME_INTEGRATION
+timeMethod = 0          # RK3-WS2002
+Nt         = 720000     # 2 hrs at dt=0.01 s (7200 s total)
+dt         = 0.01       # acoustic CFL = 340*0.01/10 = 0.34 << sqrt(3) ✓
+NtBatch    = 7500
+#--HYDRO_CORE
+hydroBCs = 2 # periodic horizontal, vertical ABL
+ceilingAdvectionBC  = 1
+hydroBndysFileBase  = BNDYS_PLACEHOLDER
+hydroBndysFileStart = 0
+hydroBndysFileEnd   = 1
+dtBdyPlaneBCs       = 600000.0
+hydroForcingWrite   = 0
+hydroSubGridWrite   = 1
+hydroForcingLog     = 0
+advectionSelector   = 3         # hybrid 5th/6th-order
+b_hyb               = 0.0
+moistureSelector    = 0
+moistureNvars       = 2
+moistureAdvSelectorQv   = 2
+moistureAdvSelectorQv_b = 0.0
+moistureAdvSelectorQi   = 2
+moistureSGSturb     = 1
+moistureCond        = 3
+moistureCondTscale  = 1.0
+moistureCondBasePres = 1
+moistureMPcallTscale = 1.0
+coriolisSelector    = 1
+coriolisLatitude    = 40.0      # generic mid-latitude
+turbulenceSelector  = 1         # Lilly/Smagorinsky
+TKESelector         = 1
+TKEAdvSelector      = 3
+TKEAdvSelector_b_hyb = 0.0
+c_s = 0.18
+c_k = 0.10
+diffusionSelector   = 0
+nu_0                = 0.0
+filterSelector      = 1
+filter_6thdiff_vert       = 1
+filter_6thdiff_vert_coeff = 0.03
+filter_6thdiff_hori       = 1
+filter_6thdiff_hori_coeff = 0.03
+dampingLayerSelector = 1
+dampingLayerDepth    = 250.0    # m; slightly deeper to damp terrain-induced upward propagating waves
+#--SURFACE LAYER (neutral)
+surflayerSelector   = 1
+surflayer_z0        = 0.1       # m; open grassland/shrubland
+surflayer_z0t       = 0.01
+surflayer_wth       = 0.0       # neutral: no heat flux
+surflayer_tr        = 0.0
+surflayer_wq        = 0.0
+surflayer_qr        = 0.0
+surflayer_idealsine = 0
+surflayer_ideal_ts  = 0.0
+surflayer_ideal_te  = 43200
+surflayer_ideal_amp = 4.0
+surflayer_ideal_qts = 1.75
+surflayer_ideal_qte = 10.0
+surflayer_ideal_qamp = 2.0
+surflayer_offshore  = 0
+#--BASE STATE
+stabilityScheme     = 2
+temp_grnd           = 300.0
+pres_grnd           = 100000.0
+zStableBottom       = 500.0
+stableGradient      = 0.08
+zStableBottom2      = 650.0
+stableGradient2     = 0.003
+zStableBottom3      = 50000.0
+stableGradient3     = 0.003
+thetaPerturbationSwitch = 1
+thetaHeight             = 375.0
+thetaAmplitude          = 0.25
+U_g    = UG_PLACEHOLDER
+V_g    = VG_PLACEHOLDER
+z_Ug   = 10000.0
+z_Vg   = 10000.0
+Ug_grad = 0.0
+Vg_grad = 0.0
+#--LARGE SCALE FORCINGS
+lsfSelector = 0
