@@ -25,8 +25,8 @@ end
 # GridInfo struct, describes the LES terrain-following grid. Read from a single output file (u)
 # Coordinate arrays are full 3D (terrain-following sigma coords)
 struct GridInfo
-    Nx        :: Int
-    Ny        :: Int
+    Nx        :: Int                 # number of grid cells in x direction
+    Ny        :: Int                 # number of grid cells in y direction 
     Nz        :: Int
     dx        :: Float32
     dy        :: Float32
@@ -108,7 +108,10 @@ function load_grid(filepath::String) :: GridInfo
         yPos = Float32.(ds["yPos"][:, :, :, 1])
         zPos = Float32.(ds["zPos"][:, :, :, 1])
         Nx, Ny, Nz = size(u)
-        GridInfo(Nx, Ny, Nz, 20f0, 20f0, xPos, yPos, zPos, Nx*Ny*Nz, 3*Nx*Ny*Nz)
+        # derive grid spacing from the coordinate arrays (do NOT hardcode)
+        dx = Nx > 1 ? xPos[2,1,1] - xPos[1,1,1] : 1f0
+        dy = Ny > 1 ? yPos[1,2,1] - yPos[1,1,1] : 1f0
+        GridInfo(Nx, Ny, Nz, dx, dy, xPos, yPos, zPos, Nx*Ny*Nz, 3*Nx*Ny*Nz)
     end
 end
 # get ensemble config from file
@@ -156,7 +159,7 @@ end
 # Matches files named FE_Member<id>.<timestep>, sorts by numeric timestep.
 function discover_member_files(output_dir::String, member_id::String)
     all_files = readdir(output_dir; join=false)
-    pat = Regex("^FE_Member$(member_id)\\.([0-9]+)\$")
+    pat = Regex("^FE_ensemble_$(member_id)\\.([0-9]+)\$")
     matched = Tuple{Int,String}[]
     for f in all_files
         m = match(pat, f)

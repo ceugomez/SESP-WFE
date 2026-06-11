@@ -15,9 +15,9 @@ struct PODBasis
     coeffs        :: Matrix{Float32}   # (?,?) - POD modal coefficients for all timesteps. as (rows=modes, cols=timesteps)
     modes         :: Matrix{Float32}   # (state_dim, L) — orthonormal POD modes ψ_k
     eigenvalues   :: Vector{Float64}   # (L,) descending in magnitude
-    L             :: Int
-    n_snapshots   :: Int
-    grid          :: GridInfo
+    L             :: Int               # length of eigenvalues/modes 
+    n_snapshots   :: Int               # number of snapshots ()
+    grid          :: GridInfo          # grid definition, see fasteddy_io.jl
 end
 
 # save and load POD basis 

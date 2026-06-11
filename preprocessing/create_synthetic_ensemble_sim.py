@@ -22,7 +22,7 @@ from scipy.stats.qmc import LatinHypercube
 # ---------------------------------------------------------------------------
 
 # Ensemble parameters
-N_MEMBERS    = 20          # number of prior ensemble members
+N_MEMBERS    = 12          # number of prior ensemble members
 N_TRUTH      = 1           # always 1 truth member drawn independently
 SEED         = 7291        # RNG seed for reproducibility
 
@@ -37,9 +37,9 @@ TRUTH_DIR_DEG = 265.0      # fix truth dir, or set to None to sample independent
 TRUTH_SPD_MS  = 10.0       # fix truth speed, or set to None to sample independently
 
 # Paths
-BASE_RUN_DIR  = "/home/cego6160/workspace/runs_synthetic"
-TEMPLATE_FILE = "/home/cego6160/workspace/prediction/preprocessing/FE_template_synthetic.in"
-TOPO_FILE     = "/home/cego6160/workspace/runs_synthetic/setup/terrain_idealized.bin"
+BASE_RUN_DIR  = "/home/cego6160/workspace/ensemble_runs_paper/ensemble"
+TEMPLATE_FILE = "/home/cego6160/workspace/ensemble_runs_paper/SESP-WFE/preprocessing/FE_template.in"
+TOPO_FILE     = "/home/cego6160/workspace/ensemble_runs_paper/validation_sponge/setup/terrain_steep.bin"
 CONFIG_OUT    = os.path.join(BASE_RUN_DIR, "ensemble_config.json")
 
 # ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ SLURM_TEMPLATE = """\
 
 source ~/workspace/fasteddy_env.sh
 
-export BASEDIR=/opt/FastEddy-model
+export BASEDIR=/home/cego6160/workspace/ensemble_runs_paper/FastEddy-model
 export SRCDIR=$BASEDIR/SRC/FEMAIN
 export RUNDIR={member_dir}
 
@@ -126,8 +126,6 @@ def write_namelist(template_path: str, member_dir: str, member_id: str,
 
     out_dir    = os.path.join(member_dir, "output")
     log_dir    = os.path.join(member_dir, "log")
-    infile     = os.path.join(member_dir, f"FE_ensemble_{member_id}_IC.nc")
-    bndys_base = os.path.join(member_dir, f"FE_ensemble_{member_id}_bndys")
     nml_path   = os.path.join(member_dir, f"FE_ensemble_{member_id}.in")
 
     replacements = {
@@ -136,7 +134,6 @@ def write_namelist(template_path: str, member_dir: str, member_id: str,
         "OUTPATH_PLACEHOLDER":  out_dir,
         "MEMBER_PLACEHOLDER":   member_id,
         "TOPOFILE_PLACEHOLDER": TOPO_FILE,
-        "BNDYS_PLACEHOLDER":    bndys_base,
         "UG_PLACEHOLDER":       f"{U_g:.6f}",
         "VG_PLACEHOLDER":       f"{V_g:.6f}",
     }

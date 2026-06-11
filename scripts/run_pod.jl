@@ -3,9 +3,9 @@
 using LinearAlgebra
 
 # ---- Configuration ----
-const CONFIG_PATH  = "/home/cego6160/workspace/runs_lad/ensemble_config.json"
-const WORKDIR      = "/home/cego6160/workspace/prediction/src"
-const OUTPUT_DIR   = "/home/cego6160/workspace/prediction/output"
+const CONFIG_PATH  = "/home/cego6160/workspace/ensemble_runs_paper"
+const WORKDIR      = "/home/cego6160/workspace/ensemble_runs_paper/SESP-WFE/src"
+const OUTPUT_DIR   = "/home/cego6160/workspace/ensemble_runs_paper/output"
 const L            = 50          # number of POD modes to retain
 const T_SPINUP     = 900.0       # seconds — exclude spin-up transient behavior (default 15 min)
 const BASIS_FILE   = joinpath(OUTPUT_DIR, "pod_basis.jld2")

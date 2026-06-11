@@ -1,0 +1,125 @@
+Description = Lateral-sponge ensemble template / truth run. 506x506x82 @10m. Asym y-elongated ridge (100m peak) -> meandering lee wake in neutral flow. Periodic + 4-face Rayleigh sponge. alpha=265deg, 10 m/s. Per-member: change U_g,V_g only.
+#--MPI_AALES
+numProcsX = 1
+numProcsY = 1
+#--CUDA_AALES
+tBx = 8   # (378+6=384 = 8*48)
+tBy = 8
+tBz = 4   # (162+6=168 = 4*42)
+#--IO
+inPath     = INPATH_PLACEHOLDER
+inFile     = INFILE_PLACEHOLDER
+outPath    = OUTPATH_PLACEHOLDER
+outFileBase = FE_ensemble_MEMBER_PLACEHOLDER
+frqOutput  = 300        # every 6s at dt=0.02
+ioOutputMode = 0
+#--GRID
+Nx = 506            # 5060 m at dx=10 m; (506+6)=512=8*64; isolated hill near x=1.3km
+Ny = 506            # 5060 m at dy=10 m; (506+6)=512=8*64; square domain
+Nz = 82             # (82+6)=88=4*22 ; domain top ~600 m
+Nh = 3
+d_xi   = 10.0
+d_eta  = 10.0
+d_zeta = 10.0
+coordHorizHalos     = 0
+topoFile            = TOPOFILE_PLACEHOLDER
+verticalDeformSwitch    = 1     # terrain-following sigma coords
+verticalDeformFactor    = 0.78  # increased from 0.65 to resolve steep ~26 deg slopes
+verticalDeformQuadCoeff = 0.0
+#--TIME_INTEGRATION
+timeMethod = 0          # RK3-WS2002
+Nt         = 125000     # 2500s at dt=0.02 (~5 domain flow-throughs @ U=10/L=5km); discard first ~1000s spin-up, sample developed meandering wake after. Sponge prevents wake wraparound so no truncation needed.
+dt         = 0.02       # acoustic CFL = 340*0.02/10 = 0.68 (FastEddy fully compressible, no acoustic substep -> dt bound by sound speed; dt=0.025/CFL0.85 NaN'd the whole field at t=6s)
+NtBatch    = 300        # matches frqOutput so output fires every batch
+#--HYDRO_CORE
+hydroBCs = 2 # periodic horizontal, vertical ABL
+ceilingAdvectionBC  = 1
+hydroBndysFileStart = 0
+hydroBndysFileEnd   = 1
+dtBdyPlaneBCs       = 600000.0
+hydroForcingWrite   = 0
+hydroSubGridWrite   = 1
+hydroForcingLog     = 0
+advectionSelector   = 3         # hybrid 5th/6th-order
+b_hyb               = 0.0
+moistureSelector    = 0
+moistureNvars       = 2
+moistureAdvSelectorQv   = 2
+moistureAdvSelectorQv_b = 0.0
+moistureAdvSelectorQi   = 2
+moistureSGSturb     = 1
+moistureCond        = 3
+moistureCondTscale  = 1.0
+moistureCondBasePres = 1
+moistureMPcallTscale = 1.0
+coriolisSelector    = 1
+coriolisLatitude    = 40.0      # generic mid-latitude
+turbulenceSelector  = 1         # Lilly/Smagorinsky
+TKESelector         = 1
+TKEAdvSelector      = 3
+TKEAdvSelector_b_hyb = 0.0
+c_s = 0.18
+c_k = 0.10
+diffusionSelector   = 0
+nu_0                = 0.0
+filterSelector      = 1
+filter_6thdiff_vert       = 1
+filter_6thdiff_vert_coeff = 0.03
+filter_6thdiff_hori       = 1
+filter_6thdiff_hori_coeff = 0.03
+filter_divdamp            = 1   # divergence damping; suppresses terrain-induced velocity noise on steep ridgeline (present in old ensemble runs, was dropped in sponge namelist)
+dampingLayerSelector = 1
+dampingLayerDepth    = 250.0    # m; vertical (top) sponge for terrain-induced upward-propagating waves
+#--LATERAL RAYLEIGH DAMPING (SPONGE) -- fringe region on all 4 x/y faces, relax to geostrophic base state
+lateralDampingSelector = 1
+lateralDampingWidth    = 40     # cells (400 m) inward from each face; hill at ~1.3km clears all sponges
+lateralDampingCoeff    = 0.2    # 1/s max rate (tau~5s); ~40s transit of 400m sponge -> strong wake absorption
+#--CELL PERTURBATION METHOD (inflow turbulence trip) -- TEST: symmetric sponge may re-laminarize before hill
+cellpertSelector   = 1
+cellpert_sw2b      = 0          # 0= all four lateral boundaries
+cellpert_amp       = 0.5        # K; mild theta perturbation amplitude
+cellpert_nts       = 500        # reseed every 500 steps (~10s at dt=0.02)
+cellpert_gppc      = 8          # grid points per perturbation cell
+cellpert_ndbc      = 3          # cells normal to boundary (seed zone ~3*8=24 cells = 240m from each face)
+cellpert_kbottom   = 1          # lowest level above surface
+cellpert_ktop      = 20         # up to ~200m AGL (covers hill + near-surface BL)
+cellpert_tvcp      = 0
+cellpert_eckert    = 0.2
+cellpert_tsfact    = 1.0
+#--SURFACE LAYER (neutral)
+surflayerSelector   = 1
+surflayer_z0        = 0.1       # m; open grassland/shrubland
+surflayer_z0t       = 0.01
+surflayer_wth       = 0.0       # neutral: turbulence-suppression no longer needed (sponge handles wraparound; CPM trips inflow)
+surflayer_tr        = 0.0
+surflayer_wq        = 0.0
+surflayer_qr        = 0.0
+surflayer_idealsine = 0
+surflayer_ideal_ts  = 0.0
+surflayer_ideal_te  = 43200
+surflayer_ideal_amp = 4.0
+surflayer_ideal_qts = 1.75
+surflayer_ideal_qte = 10.0
+surflayer_ideal_qamp = 2.0
+surflayer_offshore  = 0
+#--BASE STATE
+stabilityScheme     = 2
+temp_grnd           = 300.0
+pres_grnd           = 100000.0
+zStableBottom       = 700.0
+stableGradient      = 0.003     # 0.08 caused T_BV resonance crash at t~120s
+zStableBottom2      = 900.0
+stableGradient2     = 0.003
+zStableBottom3      = 50000.0
+stableGradient3     = 0.003
+thetaPerturbationSwitch = 1
+thetaHeight             = 375.0
+thetaAmplitude          = 0.25
+U_g    = UG_PLACEHOLDER         # set per-member from sampled (spd,dir)
+V_g    = VG_PLACEHOLDER
+z_Ug   = 10000.0
+z_Vg   = 10000.0
+Ug_grad = 0.0
+Vg_grad = 0.0
+#--LARGE SCALE FORCINGS
+lsfSelector = 0
