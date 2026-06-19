@@ -46,9 +46,39 @@ struct NCfield
     w    :: Array{Float32,4}     # (Nx, Ny, Nz, T) vertical wind, m/s
 end
 
+# Analysis domain mask: excludes the lateral sponge fringe + margin on all four x/y faces.
+# The flat state vector [u;v;w] used by the POD/filter contains only interior (unforced) cells.
+# margin_m: exclusion distance in metres from each lateral face (default 600 m = 400 m sponge + buffer).
+struct AnalysisDomain
+    mask      :: BitArray{3}   # (Nx, Ny, Nz) — true = interior cell included in state
+    n_grid    :: Int           # count(mask)
+    state_dim :: Int           # 3 * n_grid
+end
+
+function AnalysisDomain(grid::GridInfo; margin_m::Float32=600f0) :: AnalysisDomain
+    cx = round(Int, margin_m / grid.dx)
+    cy = round(Int, margin_m / grid.dy)
+    mask = falses(grid.Nx, grid.Ny, grid.Nz)
+    mask[cx+1:grid.Nx-cx, cy+1:grid.Ny-cy, :] .= true
+    n = count(mask)
+    return AnalysisDomain(mask, n, 3n)
+end
+
 
 # ---------- output functions ----------------
-# Unpack a single flat state vector [u;v;w] back into 3D fields.
+# Unpack a flat masked state vector [u;v;w] back into full 3D fields (zeros outside the domain).
+function unpack_snapshot(x::AbstractVector{Float32}, grid::GridInfo, domain::AnalysisDomain)
+    n   = domain.n_grid
+    u3  = zeros(Float32, grid.Nx, grid.Ny, grid.Nz)
+    v3  = zeros(Float32, grid.Nx, grid.Ny, grid.Nz)
+    w3  = zeros(Float32, grid.Nx, grid.Ny, grid.Nz)
+    u3[domain.mask] = x[1:n]
+    v3[domain.mask] = x[n+1:2n]
+    w3[domain.mask] = x[2n+1:3n]
+    return u3, v3, w3
+end
+
+# Legacy overload (full-grid, no domain mask) — kept for backward compatibility.
 function unpack_snapshot(x::AbstractVector{Float32}, grid::GridInfo)
     n = grid.n_grid
     u = reshape(x[1:n],    grid.Nx, grid.Ny, grid.Nz)
@@ -115,40 +145,58 @@ function load_grid(filepath::String) :: GridInfo
     end
 end
 # get ensemble config from file
-function load_ensemble_config(config_path::String) :: EnsembleConfig
+function load_ensemble_config(config_path::String;
+                              include_ids::Union{Vector{String},Nothing}=nothing,
+                              exclude_ids::Union{Vector{String},Nothing}=nothing) :: EnsembleConfig
     @info "Parsing ensemble config: $config_path"
     cfg = JSON3.read(read(config_path, String))
-    prior_members = [_make_member_info(m) for m in cfg.prior_members]
+    entries = collect(cfg.prior_members)
+    if !isnothing(include_ids)
+        entries = filter(m -> String(m.id) in include_ids, entries)
+    end
+    if !isnothing(exclude_ids)
+        entries = filter(m -> !(String(m.id) in exclude_ids), entries)
+    end
+    prior_members = [_make_member_info(m) for m in entries]
     truth_member  = _make_member_info(cfg.truth_member)
     return EnsembleConfig(length(prior_members), prior_members, truth_member)
 end
 
 
-# 
 # Load a single snapshot as a flat state vector [u; v; w] (Float32).
-# Flattening is Julia column-major: x varies fastest.
-function load_snapshot(filepath::String) :: Vector{Float32}
+# If domain is provided, only interior cells are included (length = domain.state_dim).
+# Flattening is Julia column-major: x varies fastest within each component block.
+function load_snapshot(filepath::String,
+                       domain::Union{AnalysisDomain,Nothing}=nothing) :: Vector{Float32}
     NCDataset(filepath, "r") do ds
         u = ds["u"][:, :, :, 1]    # (Nx, Ny, Nz)
         v = ds["v"][:, :, :, 1]
         w = ds["w"][:, :, :, 1]
-        vcat(vec(u), vec(v), vec(w))
+        if isnothing(domain)
+            return vcat(vec(u), vec(v), vec(w))
+        else
+            m = domain.mask
+            return vcat(vec(u[m]), vec(v[m]), vec(w[m]))
+        end
     end
 end
+
 # Load post-spinup snapshots for one member as a (state_dim, T) matrix.
+# state_dim = domain.state_dim if domain provided, else grid.state_dim.
 function load_member_snapshots(member::MemberInfo;
-                                t_spinup::Float64=900.0) :: Matrix{Float32}
+                                t_spinup::Float64=900.0,
+                                domain::Union{AnalysisDomain,Nothing}=nothing) :: Matrix{Float32}
     mask  = _spinup_mask(member, t_spinup)
     files = member.files[mask]
     T     = length(files)
     T == 0 && error("No post-spinup snapshots for member $(member.id) " *
                     "(t_spinup=$(t_spinup) s, max sim_time=$(maximum(member.sim_times)) s)")
-    x0        = load_snapshot(files[1])
+    x0        = load_snapshot(files[1], domain)
     state_dim = length(x0)
     U         = Matrix{Float32}(undef, state_dim, T)
     U[:, 1]   = x0
     for t in 2:T
-        U[:, t] = load_snapshot(files[t])
+        U[:, t] = load_snapshot(files[t], domain)
     end
     return U
 end
