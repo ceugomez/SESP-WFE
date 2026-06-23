@@ -87,6 +87,20 @@ function unpack_snapshot(x::AbstractVector{Float32}, grid::GridInfo)
     return u, v, w
 end
 
+# Unpack a domain-masked snapshot matrix (domain.state_dim, T) into an NCfield,
+# zero-filling cells outside the domain mask (e.g. the lateral sponge margin).
+function unpack_to_NCfield(X::AbstractMatrix{Float32}, t::Vector{Float32},
+                            grid::GridInfo, domain::AnalysisDomain) :: NCfield
+    T_len = size(X, 2)
+    u4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T_len)
+    v4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T_len)
+    w4 = Array{Float32,4}(undef, grid.Nx, grid.Ny, grid.Nz, T_len)
+    for i in 1:T_len
+        u4[:,:,:,i], v4[:,:,:,i], w4[:,:,:,i] = unpack_snapshot(view(X, :, i), grid, domain)
+    end
+    return NCfield(t, grid, u4, v4, w4)
+end
+
 # Reconstruct NCfield for member `member_idx` (1-based) from the full snapshot matrix.
 # U is (state_dim, M*T) as built by build_snapshot_matrix; t_spinup must match what was used to build it.
 # overloaded to get a single member (usually truth), or
