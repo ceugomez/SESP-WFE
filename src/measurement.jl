@@ -23,6 +23,15 @@ function get_measurement_sequence(U::NCfield, grid::GridInfo, domain::AnalysisDo
 	return [get_measurement_set(U, grid, randLocsInBounds(grid, domain, nm), mvar, t) for t in tidx]
 end
 
+# set of static location measurements for every timestep
+function get_static_measurement_sequence(U::NCField, grid::GridInfo, locations::Vector{Vector{Float32}}, domain::AnalysisDomain, nm::Int, mvar::Matrix{Float32}, tidx::Vector{Int})::Vector{measSet}
+	# samples a set of nm measurements in static locationsacross the U truth field
+	# for every timestep in 
+
+
+
+end
+
 
 # takes a scalar measurement from the field at a continous position 
 function get_scalar_measurement(U::NCfield, grid::GridInfo, loc::Vector{Float32}, var::Matrix{Float32}, tidx::Int)::meas
@@ -153,12 +162,6 @@ function build_measurement_covariance(nm::Int, mvar::Matrix{Float32})::Matrix{Fl
 	return R
 end
 
-# Helper functions
-function idx2loc(locidx::Vector{Int}, grid::GridInfo)::Vector{Float32}
-	# for input indices in discretized space 
-	# output that grid cell
-	return Vector{Float32}([grid.xPos[locidx[1]], grid.yPos[locidx[2]], grid.zPos[locidx[3]]])
-end
 
 function loc2idx(loc::Vector{Float32}, grid::GridInfo)::Vector{Int}
 	# for input location in continuous space within the domain

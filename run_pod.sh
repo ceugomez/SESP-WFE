@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=612G
-#SBATCH --time=6:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/home/cego6160/workspace/ensemble_runs_paper/SESP-WFE/log/pod_%j.log
 
 # POD basis construction for FastEddy wind-direction ensemble.

@@ -101,6 +101,55 @@ function unpack_to_NCfield(X::AbstractMatrix{Float32}, t::Vector{Float32},
     return NCfield(t, grid, u4, v4, w4)
 end
 
+# Flat state-vector index of grid cell (i,j,k) for velocity component comp (:u/:v/:w),
+# in the SAME ordering load_snapshot uses: vcat(vec(u[mask]), vec(v[mask]), vec(w[mask])),
+# column-major within each masked block. Errors if (i,j,k) lies outside the analysis domain.
+function cell_to_state_index(domain::AnalysisDomain, i::Int, j::Int, k::Int, comp::Symbol) :: Int
+    domain.mask[i, j, k] || error("cell ($i,$j,$k) is outside the analysis domain (sponge margin)")
+    # position of (i,j,k) among masked cells, column-major (matches vec(u[mask]))
+    lin = reshape(cumsum(vec(domain.mask)), size(domain.mask))
+    p   = lin[i, j, k]
+    off = comp === :u ? 0 : comp === :v ? domain.n_grid : 2 * domain.n_grid
+    return off + p
+end
+
+# Map a physical target (x,y in metres, z in metres AGL) to the nearest interior grid cell.
+# Returns (i,j,k). Uses the grid coordinate arrays; z is matched above local terrain (zPos[i,j,1]).
+function nearest_cell(grid::GridInfo, domain::AnalysisDomain, x_m::Real, y_m::Real, z_agl_m::Real)
+    i = argmin(abs.(grid.xPos[:, 1, 1] .- Float32(x_m)))
+    j = argmin(abs.(grid.yPos[1, :, 1] .- Float32(y_m)))
+    terrain = grid.zPos[i, j, 1]
+    k = argmin(abs.(grid.zPos[i, j, :] .- (terrain + Float32(z_agl_m))))
+    domain.mask[i, j, k] || error("nearest cell ($i,$j,$k) to (x=$x_m, y=$y_m, z_agl=$z_agl_m) " *
+                                  "is inside the sponge margin; move the reference point inward")
+    return i, j, k
+end
+
+# Write u/v/w 3D fields to a FastEddy-format NetCDF the Python slice plotters can read directly.
+# Stores xPos/yPos/zPos/topoPos so plot_xy_slices.py / plot_xz_slices.py work unchanged.
+# Dimension order is (xIndex,yIndex,zIndex,time): NCDatasets writes it reversed, so Python sees
+# (time,zIndex,yIndex,xIndex) — exactly the layout the plotters expect.
+function write_fasteddy_nc(filepath::String,
+                            u3::Array{Float32,3}, v3::Array{Float32,3}, w3::Array{Float32,3},
+                            grid::GridInfo; t::Float32=0f0)
+    isfile(filepath) && rm(filepath)
+    NCDataset(filepath, "c") do ds
+        defDim(ds, "xIndex", grid.Nx); defDim(ds, "yIndex", grid.Ny)
+        defDim(ds, "zIndex", grid.Nz); defDim(ds, "time", 1)
+        d4 = ("xIndex", "yIndex", "zIndex", "time")
+        for (name, arr) in (("u", u3), ("v", v3), ("w", w3),
+                            ("xPos", grid.xPos), ("yPos", grid.yPos), ("zPos", grid.zPos))
+            v = defVar(ds, name, Float32, d4)
+            v[:, :, :, 1] = arr
+        end
+        tp = defVar(ds, "topoPos", Float32, ("xIndex", "yIndex", "time"))
+        tp[:, :, 1] = grid.zPos[:, :, 1]               # surface height = terrain
+        tv = defVar(ds, "time", Float32, ("time",))
+        tv[1] = t
+    end
+    @info "Wrote FastEddy-format NetCDF: $filepath"
+end
+
 # Reconstruct NCfield for member `member_idx` (1-based) from the full snapshot matrix.
 # U is (state_dim, M*T) as built by build_snapshot_matrix; t_spinup must match what was used to build it.
 # overloaded to get a single member (usually truth), or

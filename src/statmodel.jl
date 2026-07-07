@@ -17,12 +17,13 @@ function get_prior_and_process_noise(basis::PODBasis)
 end
 
 # Prior mean/covariance of the POD coefficients α, pooled over all members and times.
+# Mean over coefficient set in ensemble + variance over coefficient set in ensemble
 #
 #   α_0 = (1 / (M·N_t)) Σ_{i,n} α^(i)(t_n)
 #   P_0 = (1 / (M·N_t - 1)) Σ_{i,n} (α^(i)(t_n) - α_0)(α^(i)(t_n) - α_0)'
 #
 # basis.coeffs is (L, N) with N = M·N_t columns (member-blocks of post-spinup snapshots),
-# so this is just the column-wise mean and unbiased sample covariance
+# so this is just the column-wise mean and unbiased sample covariance fir
 function get_prior_from_ensemble(basis::PODBasis)
     a    = basis.coeffs                              # (L, N), N = M·N_t
     μ_α0 = vec(mean(a; dims=2))                       # (L,)
@@ -30,13 +31,6 @@ function get_prior_from_ensemble(basis::PODBasis)
     return Float32.(μ_α0), Float32.(Σ_α0)
 end
 
-function get_truncation_measurment_error(meas::measSet, )
-    # gets truncation error for each location
-    # stub
-
-
-    return nothing
-end
 
 # Process-noise covariance Q_α for the random-walk-in-subspace SSM, built from the
 # ensemble's temporal increments of the POD coefficients:
