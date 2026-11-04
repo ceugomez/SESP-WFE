@@ -1,16 +1,18 @@
 # plot_rep_error_fields.py
-# cgf  2026-06-26
+# cgf  2026-07-08
 #
-# Spatial representability-error (projection-floor) contour plots for each LOO basis.
-# Reads rep_error_field_XX.nc files written by scripts/make_rep_error_fields.jl and
-# produces a 2×N panel figure (x-y plane + wake-aligned vertical slice per member).
-#
-# A shared colourbar spans all members so the panels are directly comparable.
+# Plain x-y and x-z slices of the representability-error (σ_rep) fields, one
+# column per truth id, sharing a colourbar so panels are directly comparable.
+# Reads rep_error_field_XX.nc written by scripts/make_rep_error_fields.jl —
+# standard FastEddy-format NetCDF (u/v/w/xPos/yPos/zPos/topoPos), where u/v/w
+# here are the per-component σ_rep(ζ), not a wind field. Plotted quantity is
+# the combined magnitude speed = sqrt(u²+v²+w²).
 #
 # Usage:
-#   python plot_rep_error_fields.py [--nc-dir DIR] [--z-agl 100] [--az 5]
+#   python plot_rep_error_fields.py [--nc-dir DIR] [--z-agl 100] [--jslice J]
 #                                   [--members 00 01 ...] [--out PNG]
-#   Defaults: nc-dir = output/, z-agl = 100 m, az = 5°, all members found.
+#   Defaults: nc-dir = output/fields, z-agl = 100 m, jslice = domain midpoint,
+#             all members found.
 
 import argparse, os, glob
 import numpy as np
@@ -20,104 +22,105 @@ import matplotlib.pyplot as plt
 from netCDF4 import Dataset
 
 
-def load(nc, name):
-    return np.asarray(nc[name][0]).transpose(2, 1, 0)   # (time,z,y,x) -> (x,y,z)
-
-
-def wake_transect(F, X, Y, Z, topo, az_deg, n_s=300):
-    nx, ny, nz = F.shape
-    x1d, y1d = X[:, 0, 0], Y[0, :, 0]
-    x0, y0 = x1d.mean(), y1d.mean()
-    half = 0.5 * min(np.ptp(x1d), np.ptp(y1d))
-    s = np.linspace(-half, half, n_s)
-    ux, uy = np.cos(np.deg2rad(az_deg)), np.sin(np.deg2rad(az_deg))
-    xs, ys = x0 + s * ux, y0 + s * uy
-    fx = np.interp(xs, x1d, np.arange(nx))
-    fy = np.interp(ys, y1d, np.arange(ny))
-    i0 = np.clip(fx.astype(int), 0, nx - 2)
-    j0 = np.clip(fy.astype(int), 0, ny - 2)
-    tx, ty = fx - i0, fy - j0
-    plane = np.empty((nz, n_s))
-    for c in range(n_s):
-        i, j, a, b = i0[c], j0[c], tx[c], ty[c]
-        plane[:, c] = ((1-a)*(1-b)*F[i,j,:] + a*(1-b)*F[i+1,j,:]
-                      + (1-a)*b*F[i,j+1,:] + a*b*F[i+1,j+1,:])
-    zcol = Z[nx//2, ny//2, :]
-    terr = ((1-tx)*(1-ty)*topo[i0,j0] + tx*(1-ty)*topo[i0+1,j0]
-           + (1-tx)*ty*topo[i0,j0+1] + tx*ty*topo[i0+1,j0+1])
-    return s, zcol, plane, terr
+def interp_to_zagl(field3d, zpos3d, topo2d, z_agl):
+    """(Nz,Ny,Nx) field, terrain-following zpos3d -> (Ny,Nx) slice at z_agl AGL."""
+    Nz, Ny, Nx = field3d.shape
+    z_target = (topo2d + z_agl).astype(np.float32)
+    zT = np.moveaxis(zpos3d, 0, -1)   # (Ny,Nx,Nz)
+    fT = np.moveaxis(field3d, 0, -1)  # (Ny,Nx,Nz)
+    out = np.full((Ny, Nx), np.nan, dtype=np.float32)
+    for j in range(Ny):
+        zrow, frow, zt = zT[j], fT[j], z_target[j]
+        idx = np.searchsorted(zrow[0], zt)
+        valid = (idx > 0) & (idx < Nz)
+        i_lo = np.clip(idx - 1, 0, Nz - 2)
+        z_lo = zrow[np.arange(Nx), i_lo]; z_hi = zrow[np.arange(Nx), i_lo + 1]
+        f_lo = frow[np.arange(Nx), i_lo]; f_hi = frow[np.arange(Nx), i_lo + 1]
+        dz = z_hi - z_lo
+        w = np.where(dz > 0, (zt - z_lo) / dz, 0.5)
+        out[j] = np.where(valid, f_lo + w * (f_hi - f_lo), np.nan)
+    return out
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--nc-dir", default=None,
                    help="directory containing rep_error_field_XX.nc files")
-    p.add_argument("--z-agl", type=float, default=100.0)
-    p.add_argument("--az", type=float, default=5.0)
+    p.add_argument("--z-agl", type=float, default=100.0, help="x-y slice height AGL (m)")
+    p.add_argument("--jslice", type=int, default=None, help="y-index for x-z slice (default: midpoint)")
     p.add_argument("--members", nargs="*", default=None,
-                   help="member IDs to include, e.g. 00 01 02 (default: all found)")
+                   help="member/truth IDs to include, e.g. 00 01 02 (default: all found)")
+    p.add_argument("--level-step", type=float, default=0.1, help="contour level spacing (m/s)")
     p.add_argument("--out", default=None)
     args = p.parse_args()
 
     nc_dir = args.nc_dir or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "output")
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "results", "fields")
     nc_dir = os.path.realpath(nc_dir)
 
     if args.members:
-        nc_files = [(mid, os.path.join(nc_dir, f"rep_error_field_{mid}.nc"))
-                    for mid in args.members]
+        nc_files = [(mid, os.path.join(nc_dir, f"rep_error_field_{mid}.nc")) for mid in args.members]
     else:
-        found = sorted(glob.glob(os.path.join(nc_dir, "rep_error_field_??.nc")))
-        nc_files = [(os.path.basename(f)[16:18], f) for f in found]
+        found = sorted(glob.glob(os.path.join(nc_dir, "rep_error_field_*.nc")))
+        nc_files = [(os.path.basename(f)[len("rep_error_field_"):-3], f) for f in found]
 
     if not nc_files:
-        raise SystemExit(f"No rep_error_field_XX.nc files found in {nc_dir}")
+        raise SystemExit(f"No rep_error_field_*.nc files found in {nc_dir}")
 
-    # load all fields; build shared colour scale
     data = []
     for mid, fpath in nc_files:
-        nc = Dataset(fpath)
-        X = load(nc, "xPos"); Y = load(nc, "yPos"); Z = load(nc, "zPos")
-        topo = np.asarray(nc["topoPos"][0]).T
-        F = load(nc, "proj_speed")
-        data.append((mid, X, Y, Z, topo, F))
+        with Dataset(fpath) as ds:
+            xpos = ds["xPos"][0, :, :, :]   # (Nz,Ny,Nx)
+            ypos = ds["yPos"][0, :, :, :]
+            zpos = ds["zPos"][0, :, :, :]
+            topo = np.asarray(ds["topoPos"][0, :, :])   # (Ny,Nx)
+            u = np.asarray(ds["u"][0, :, :, :], dtype=np.float32)
+            v = np.asarray(ds["v"][0, :, :, :], dtype=np.float32)
+            w = np.asarray(ds["w"][0, :, :, :], dtype=np.float32)
+        speed = np.sqrt(u**2 + v**2 + w**2)   # (Nz,Ny,Nx)
+        data.append((mid, xpos, ypos, zpos, topo, speed))
 
-    zc = data[0][3][0, 0, :]
-    kz = int(np.argmin(np.abs((zc - zc[0]) - args.z_agl)))
-    vmax = max(np.percentile(d[5][d[5] > 0], 99) for d in data)
+    Nz, Ny, Nx = data[0][5].shape
+    j_slice = args.jslice if args.jslice is not None else Ny // 2
+    vmax = max(np.nanpercentile(d[5], 99) for d in data)
 
     N = len(data)
-    fig, axes = plt.subplots(2, N, figsize=(4.5 * N, 9), constrained_layout=True,
-                              squeeze=False)
+    fig, axes = plt.subplots(2, N, figsize=(4.5 * N, 9), constrained_layout=True, squeeze=False)
     fig.suptitle(
-        f"Representability error (projection floor) — LOO bases\n"
-        f"x–y @ {args.z_agl:.0f} m AGL  |  vertical slice az={args.az:.0f}° from +x",
+        f"Representability error σ_rep — LOO statistical model\n"
+        f"x–y @ {args.z_agl:.0f} m AGL  |  x–z @ j={j_slice}",
         fontsize=11)
 
-    for col, (mid, X, Y, Z, topo, F) in enumerate(data):
-        # --- x-y plane ---
+    level_step = args.level_step
+    level_max = np.ceil(vmax / level_step) * level_step
+    levels = np.arange(0, level_max + level_step, level_step)
+
+    for col, (mid, xpos, ypos, zpos, topo, speed) in enumerate(data):
+
+        # --- x-y plane, interpolated to z_agl AGL ---
         ax = axes[0, col]
-        xy = np.ma.masked_equal(F[:, :, kz], 0.0)
-        pc = ax.pcolormesh(X[:, :, kz]/1000, Y[:, :, kz]/1000, xy,
-                           cmap="magma", vmin=0, vmax=vmax, shading="auto")
-        ax.contour(X[:, :, 0]/1000, Y[:, :, 0]/1000, topo, 6,
-                   colors="cyan", linewidths=0.4)
+        xy = interp_to_zagl(speed, zpos, topo, args.z_agl)
+        xkm = xpos[0] / 1e3; ykm = ypos[0] / 1e3
+        pc = ax.contourf(xkm, ykm, xy, levels=levels, cmap="magma", vmin=0, vmax=levels[-1], extend="max")
+        ax.contour(xkm, ykm, xy, levels=levels[::4], colors="k", linewidths=0.3, alpha=0.5)
+        ax.contour(xkm, ykm, topo, 6, colors="cyan", linewidths=0.4)
         ax.set_title(f"member {mid}")
         ax.set_xlabel("x (km)"); ax.set_ylabel("y (km)"); ax.set_aspect("equal")
         if col == N - 1:
-            fig.colorbar(pc, ax=ax, label="speed RMSE (m/s)")
+            fig.colorbar(pc, ax=ax, label="σ_rep (m/s)")
 
-        # --- wake vertical slice ---
+        # --- x-z slice at fixed j ---
         ax = axes[1, col]
-        s, zcol, plane, terr = wake_transect(F, X, Y, Z, topo, args.az)
-        plane = np.ma.masked_equal(plane, 0.0)
-        pc = ax.pcolormesh(s/1000, zcol, plane,
-                           cmap="magma", vmin=0, vmax=vmax, shading="auto")
-        ax.fill_between(s/1000, 0, terr, color="0.3")
-        ax.set_xlabel("along-wake (km)"); ax.set_ylabel("height (m)")
-        ax.set_ylim(0, min(zcol.max(), 1500))
+        xkm_xz = xpos[:, j_slice, :] / 1e3
+        zxz = zpos[:, j_slice, :]
+        zz = speed[:, j_slice, :]
+        pc = ax.contourf(xkm_xz, zxz, zz, levels=levels, cmap="magma", vmin=0, vmax=levels[-1], extend="max")
+        ax.contour(xkm_xz, zxz, zz, levels=levels[::4], colors="k", linewidths=0.3, alpha=0.5)
+        ax.fill_between(xkm_xz[0], 0, topo[j_slice, :], color="0.3")
+        ax.set_xlabel("x (km)"); ax.set_ylabel("z (m)")
+        ax.set_ylim(0, min(zxz.max(), 1500))
         if col == N - 1:
-            fig.colorbar(pc, ax=ax, label="speed RMSE (m/s)")
+            fig.colorbar(pc, ax=ax, label="σ_rep (m/s)")
 
     out = args.out or os.path.join(nc_dir, "rep_error_fields.png")
     fig.savefig(out, dpi=150)

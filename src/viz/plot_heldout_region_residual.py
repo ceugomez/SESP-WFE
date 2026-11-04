@@ -11,8 +11,8 @@
 # Thin light lines = per held-out member; bold = LOO mean. Threshold markers on the mean
 # (90/95/99% captured = 0.10/0.05/0.01 residual). Vertical line at the operating rank.
 #
-# y = fraction of region FLUCTUATION energy left UNREPRESENTED (block-weighted W-norm,
-# w scaled up to u,v). The endpoint = the operating-rank floor: the ceiling on any filter.
+# y = fraction of region FLUCTUATION energy left UNREPRESENTED. The endpoint = the
+# operating-rank floor: the ceiling on any filter.
 #
 # Usage: python plot_heldout_region_residual.py <csv> [--op-rank 50] [--out PNG] [--linear]
 
@@ -83,7 +83,7 @@ def main():
     rk, mu = plot_group(ax, data, "full_all", "C0", "full domain (mean)", log)
     mark_thresholds(ax, rk, mu, "C0")
     ax.set_title("Full analysis domain")
-    ax.set_ylabel("fraction of fluctuation energy unrepresented\n(block-weighted W-norm)")
+    ax.set_ylabel("fraction of fluctuation energy unrepresented")
 
     # Panel 2: wake, component split
     ax = axes[1]

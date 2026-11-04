@@ -55,12 +55,19 @@ def main():
     p.add_argument("nc")
     p.add_argument("--z-agl", type=float, default=100.0, help="height AGL for the x-y plane (m)")
     p.add_argument("--az", type=float, default=5.0, help="wake azimuth, deg from +x")
+    p.add_argument("--level-step", type=float, default=0.1, help="contour level spacing (m/s)")
     p.add_argument("--out", default=None)
     args = p.parse_args()
 
     nc = Dataset(args.nc)
     X, Y, Z = load(nc, "xPos"), load(nc, "yPos"), load(nc, "zPos")
     topo = np.asarray(nc["topoPos"][0]).T  # (x,y)
+
+    # static sensor rake positions (m), if present in the NetCDF
+    if all(v in nc.variables for v in ("sensor_x", "sensor_y", "sensor_z")):
+        sx = np.asarray(nc["sensor_x"][:]); sy = np.asarray(nc["sensor_y"][:]); sz = np.asarray(nc["sensor_z"][:])
+    else:
+        sx = sy = sz = None
     fields = {"filter total error  Prα − x_truth": load(nc, "rmse_speed"),
               "projection floor  Pr·a_truth − x_truth": load(nc, "proj_speed")}
 
@@ -68,15 +75,23 @@ def main():
     zc = Z[0, 0, :]
     kz = int(np.argmin(np.abs((zc - zc[0]) - args.z_agl)))
     vmax = max(np.percentile(f[f > 0], 99) for f in fields.values())
+    level_step = args.level_step
+    level_max = np.ceil(vmax / level_step) * level_step
+    levels = np.arange(0, level_max + level_step, level_step)
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
     for col, (title, F) in enumerate(fields.items()):
         # row 0: x-y plane
         ax = axes[0, col]
         xy = np.ma.masked_equal(F[:, :, kz], 0.0)
-        pc = ax.pcolormesh(X[:, :, kz] / 1000, Y[:, :, kz] / 1000, xy,
-                           cmap="magma", vmin=0, vmax=vmax, shading="auto")
+        pc = ax.contourf(X[:, :, kz] / 1000, Y[:, :, kz] / 1000, xy,
+                         levels=levels, cmap="magma", vmin=0, vmax=levels[-1], extend="max")
+        ax.contour(X[:, :, kz] / 1000, Y[:, :, kz] / 1000, xy,
+                   levels=levels[::4], colors="k", linewidths=0.3, alpha=0.5)
         ax.contour(X[:, :, 0] / 1000, Y[:, :, 0] / 1000, topo, 6, colors="cyan", linewidths=0.4)
+        if sx is not None:
+            ax.scatter(sx / 1000, sy / 1000, s=28, marker="v", facecolors="none",
+                       edgecolors="lime", linewidths=1.1, zorder=5, label="sensors")
         ax.set_title(f"{title}\nx–y @ {args.z_agl:.0f} m AGL")
         ax.set_xlabel("x (km)"); ax.set_ylabel("y (km)"); ax.set_aspect("equal")
         fig.colorbar(pc, ax=ax, label="speed-error RMSE (m/s)")
@@ -84,8 +99,18 @@ def main():
         ax = axes[1, col]
         s, zcol, plane, terr = wake_transect(F, X, Y, Z, topo, args.az)
         plane = np.ma.masked_equal(plane, 0.0)
-        pc = ax.pcolormesh(s / 1000, zcol, plane, cmap="magma", vmin=0, vmax=vmax, shading="auto")
+        pc = ax.contourf(s / 1000, zcol, plane, levels=levels, cmap="magma",
+                         vmin=0, vmax=levels[-1], extend="max")
+        ax.contour(s / 1000, zcol, plane, levels=levels[::4], colors="k", linewidths=0.3, alpha=0.5)
         ax.fill_between(s / 1000, 0, terr, color="0.3")
+        if sx is not None:
+            # project each sensor onto the transect azimuth (through domain centre)
+            x1d, y1d = X[:, 0, 0], Y[0, :, 0]
+            x0, y0 = x1d.mean(), y1d.mean()
+            ux, uy = np.cos(np.deg2rad(args.az)), np.sin(np.deg2rad(args.az))
+            s_sensor = ((sx - x0) * ux + (sy - y0) * uy) / 1000
+            ax.scatter(s_sensor, sz, s=28, marker="v", facecolors="none",
+                       edgecolors="lime", linewidths=1.1, zorder=5, label="sensors")
         ax.set_title(f"vertical plane along wake (az={args.az:.0f}° from +x)")
         ax.set_xlabel("along-wake distance from centre (km)"); ax.set_ylabel("height (m)")
         ax.set_ylim(0, min(zcol.max(), 1500))
@@ -93,7 +118,8 @@ def main():
 
     _fig_dir = pathlib.Path(__file__).resolve().parents[2] / "figure"
     _fig_dir.mkdir(exist_ok=True)
-    out = args.out or str(_fig_dir / "kf_field_rmse.png")
+    stem = pathlib.Path(args.nc).stem  # e.g. kf_field_rmse_truth_truth
+    out = args.out or str(_fig_dir / f"{stem}.png")
     fig.savefig(out, dpi=150)
     print(f"saved {out}")
 

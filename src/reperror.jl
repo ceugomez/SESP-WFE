@@ -4,11 +4,10 @@
 # Representativeness (reconstruction-error) model for the reduced-order filter.
 # See paper-drafts/reconstruction_error.md.
 #
-# The rank-r subspace cannot represent an unseen turbulent realization exactly; the
+# The rank-r subspace cannot represent an UNSEEN turbulent realization exactly; the
 # unrepresented part is a state-space error that the filter must account for as an
 # inflation of the observation-noise covariance, R_total = R_sensor + R_rep. This
-# module distils that inflation into four stored scalar fields built OFFLINE from the
-# same M-1 members that built the basis (never the truth member — no leakage), then
+# module distils that inflation into four stored scalar fields built OFFLINE, then
 # assembles the N×N R_rep ONLINE with no reconstruction and no tail modes:
 #
 #   σ²_rep(ζ)            per-cell residual variance         (physical units, [u;v;w])
@@ -17,8 +16,15 @@
 #
 #   Ĉ_rep(ζ₁,ζ₂) = σ_rep(ζ₁) σ_rep(ζ₂) ρ(s),  s = ‖rotate(Δ)/L‖,  ρ = e^{-s} (or e^{-s²})
 #
-# Residuals are formed directly in physical units as r_t = x_t − Pr a_t (a_t = PrᵀW x_t
-# is already stored in basis.coeffs)
+# σ²/L∥/L⊥ are estimated by LEAVE-ONE-MEMBER-OUT cross-validation over the basis's
+# training pool (the same fold structure as heldout_residual_curve in pod.jl, and the
+# same saved truth_<id>_basis.jld2 fold bases are reused when present): for each held-out
+# member k, build a basis from the OTHER members and project k onto it — r_t = x_t − Pr_{-k}
+# a_t with a_t = Pr_{-k}ᵀ x_t — so the residual is always measured on a realization the
+# fold's basis never saw, not on the training members' own (in-sample, lower) truncation
+# error. Accumulating over all folds and dividing by total snapshot count averages over the
+# M held-out members. The real truth member is never in this pool — no leakage.
+# θ (a mean-flow property, not a residual) is read once from the primary (all-prior) basis.
 
 include("pod.jl")          # PODBasis, GridInfo, AnalysisDomain, unpack_snapshot
 include("measurement.jl")  # measSet, _masked_linear_index (build_rep_covariance annotates ::measSet)
@@ -42,12 +48,34 @@ end
 # OFFLINE construction
 # ---------------------------------------------------------------------------
 
-# Build the representativeness model from a POD basis and the SAME members that built it.
-# `members` must be the in-basis members (matched to basis.member_ids); the truth member is
-# never passed. Streams one member at a time: residual r = X − Pr·coeffs accumulates σ² and,
-# at a coarse set of probe points, the flow-aligned two-point covariance used to fit L∥, L⊥.
+# Build the representativeness model by LEAVE-ONE-MEMBER-OUT cross-validation over the
+# basis's training pool (basis.member_ids). `members` must include those ids (the truth
+# member is never passed). For each held-out member k, a basis built from the OTHER members
+# is used to project k — an UNSEEN realization to that fold's basis — and the residual
+# r = X_k − Pr_{-k}·(Pr_{-k}ᵀ X_k) accumulates σ² and, at a coarse set of probe points, the
+# flow-aligned two-point covariance used to fit L∥, L⊥. Averaging is implicit: accumulators
+# sum over all M folds' snapshots and are divided by the total snapshot count at the end.
+#
+# If `gram` (the full-pool PODGram from compute_pod_streaming/build_pod_basis) is supplied,
+# any fold that must be rebuilt is derived via loo_basis_from_gram — a Gram-matrix slice, not
+# a full Pass-1 rebuild — reusing the work already done to build the primary `basis` in the
+# same session. `gram` is in-memory only (never persisted), so a caller that only *loaded*
+# `basis` from disk won't have one; pass `config_path` in that case and a fold that isn't
+# already cached in `basis_dir` falls back to a full build_pod_basis rebuild.
+# If `basis_dir` is given, fold bases are saved as truth_<held>_basis.jld2 and reused on
+# re-runs — the same files/convention heldout_residual_curve uses, so running that first (or
+# this) populates the cache for both. `cache`, if supplied, is a SnapshotCache (see
+# load_member_cache) threaded into any fold that must be rebuilt, to avoid re-reading members
+# from disk O(M²) times.
 function build_rep_error(basis::PODBasis, members::Vector{MemberInfo}, domain::AnalysisDomain;
+                          gram::Union{PODGram,Nothing}=nothing,
+                          config_path::Union{String,Nothing}=nothing,
                           t_spinup::Float64=900.0,
+                          L::Int=basis.L,
+                          margin_m::Float32=600f0,
+                          basis_dir::Union{String,Nothing}=nothing,
+                          reuse::Bool=true,
+                          cache::Union{SnapshotCache,Nothing}=nothing,
                           kernel::Symbol=:exp,
                           L_z::Float64=Inf,
                           probe_stride::Int=20,
@@ -64,12 +92,8 @@ function build_rep_error(basis::PODBasis, members::Vector{MemberInfo}, domain::A
     id2m = Dict(m.id => m for m in members)
     all(id -> haskey(id2m, id), basis.member_ids) ||
         error("members vector is missing basis members: $(setdiff(basis.member_ids, keys(id2m)))")
-    ordered = [id2m[id] for id in basis.member_ids]
-    M = length(ordered)
-    T = basis.n_snapshots ÷ M
-    M * T == basis.n_snapshots || error("basis.n_snapshots not divisible by member count")
-
-    Pr = basis.modes
+    M = length(basis.member_ids)
+    isnothing(basis_dir) || mkpath(basis_dir)
 
     # --- σ²: per-cell residual second moment, accumulated in physical units ---
     σ²_acc = zeros(Float64, 3n)
@@ -82,31 +106,52 @@ function build_rep_error(basis::PODBasis, members::Vector{MemberInfo}, domain::A
     C_par         = zeros(Float64, length(probes), nL)   # Σ_t r(ζ)·r(ζ+δ∥)
     C_perp        = zeros(Float64, length(probes), nL)
     C0            = zeros(Float64, length(probes))        # Σ_t ‖r(ζ)‖²  (zero-lag, the ρ denominator)
-    # θ at each probe (from the prior mean) sets the streamwise/cross-stream rays.
+    # θ is a mean-flow property, not a residual: read once from the primary (all-prior) basis.
     θ3 = _mean_flow_direction(basis, domain)              # (Nx,Ny,Nz)
 
     lin = _masked_linear_index(domain, grid)              # (Nx,Ny,Nz) → position in a component block
 
-    for (mi, member) in enumerate(ordered)
-        @info "  RepError: member $(member.id) ($mi/$M)..."
-        X    = load_member_snapshots(member; t_spinup, domain)   # (3n, T) Float32
-        cols = (mi-1)*T+1 : mi*T
-        a    = basis.coeffs[:, cols]                             # (L, T) — a_t = PrᵀW x_t
-        Tm   = size(X, 2)
+    for (mi, held) in enumerate(basis.member_ids)
+        @info "  RepError (LOO): fold $mi/$M, held-out member $held..."
+        basis_file = isnothing(basis_dir) ? nothing : basis_filename(basis_dir, held)
+        loo_basis = if !isnothing(basis_file) && reuse && isfile(basis_file)
+            @info "    reusing saved LOO basis ($basis_file)"
+            load_pod_basis(basis_file)
+        elseif !isnothing(gram)
+            @info "    building via Gram-matrix slice (no full rebuild)"
+            b = loo_basis_from_gram(gram, members, grid, domain; held_id=held, L, t_spinup, cache)
+            isnothing(basis_file) || save_pod_basis(b, basis_file)
+            b
+        else
+            isnothing(config_path) &&
+                error("build_rep_error: no cached fold basis for '$held', and neither `gram` " *
+                      "nor `config_path` was given to rebuild it")
+            b, _ = build_pod_basis(config_path;
+                L, t_spinup, include_ids = basis.member_ids,
+                truth_id = held, margin_m, cache)
+            isnothing(basis_file) || save_pod_basis(b, basis_file)
+            b
+        end
+
+        member = id2m[held]
+        X  = _member_snapshots(member, cache; t_spinup, domain)   # (3n, T) Float32 — unseen to loo_basis
+        Pr = loo_basis.modes
+        Tm = size(X, 2)
         # Chunk over time columns: forming the full (3n, T) residual at once would peak at
         # ~3 large arrays (X + Pra + Rres ≈ 100+ GB here). Per-chunk GEMM keeps Pr read efficient
         # while bounding peak memory to X + a couple of (3n × chunk) blocks.
         for cs in 1:chunk:Tm
             cc = cs : min(cs+chunk-1, Tm)
-            Rc = X[:, cc] .- Pr * a[:, cc]                        # (3n, |cc|) physical residual
+            a_cc = Pr' * X[:, cc]                                 # a_t = Pr_{-k}ᵀ x_t
+            Rc   = X[:, cc] .- Pr * a_cc                          # (3n, |cc|) out-of-sample residual
             σ²_acc .+= vec(sum(abs2, Rc; dims=2))                # Float32 reduction → Float64 acc
             _accumulate_two_point!(C_par, C_perp, C0, Rc, probes, lags, θ3, grid, lin, n)
         end
         n_tot += Tm
-        X = nothing; GC.gc()                                     # free the 3n×T block before next member
+        X = nothing; loo_basis = nothing; GC.gc()                # free the 3n×T block before next fold
     end
 
-    σ² = σ²_acc ./ n_tot                                         # population variance (residual mean ≈ 0)
+    σ² = σ²_acc ./ n_tot                                         # population variance, averaged over folds
 
     # --- fit L∥, L⊥ per probe, then fill grid fields by nearest probe ---
     Lpar_p  = [_fit_length(view(C_par,  pi, :) ./ C0[pi], lags, kernel) for pi in eachindex(probes)]
@@ -114,7 +159,7 @@ function build_rep_error(basis::PODBasis, members::Vector{MemberInfo}, domain::A
     L_par_f  = _fill_from_probes(Lpar_p,  probes, grid, domain)
     L_perp_f = _fill_from_probes(Lperp_p, probes, grid, domain)
 
-    @info "  RepError built: median σ_rep = $(round(sqrt(median(σ²[σ² .> 0])), digits=3)) m/s, " *
+    @info "  RepError (LOO) built: median σ_rep = $(round(sqrt(median(σ²[σ² .> 0])), digits=3)) m/s, " *
           "median L∥ = $(round(median(filter(isfinite, Lpar_p)), digits=1)) m, " *
           "L⊥ = $(round(median(filter(isfinite, Lperp_p)), digits=1)) m"
     return RepError(σ², θ3, L_par_f, L_perp_f, L_z, kernel, grid, n)

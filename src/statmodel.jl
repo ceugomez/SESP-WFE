@@ -16,6 +16,22 @@ function get_prior_and_process_noise(basis::PODBasis)
     return models(Qα, μ_α0, Σ_α0)
 end
 
+# Companion-file convention for the prior/process-noise model, saved alongside the basis
+# (truth_<id>_basis.jld2) so a downstream run can load it instead of recomputing.
+function models_filename(output_dir::String, truth_id::String) :: String
+    return joinpath(output_dir, "truth_$(truth_id)_models.jld2")
+end
+
+function save_models(mdl::models, filepath::String)
+    jldsave(filepath; Qα=mdl.Qα, μ_α0=mdl.μ_α0, Σ_α0=mdl.Σ_α0)
+    @info "Saved prior/process-noise model to $filepath"
+end
+
+function load_models(filepath::String) :: models
+    d = load(filepath)
+    return models(d["Qα"], d["μ_α0"], d["Σ_α0"])
+end
+
 # Prior mean/covariance of the POD coefficients α, pooled over all members and times.
 # Mean over coefficient set in ensemble + variance over coefficient set in ensemble
 #

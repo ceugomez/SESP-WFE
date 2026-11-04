@@ -11,25 +11,14 @@ using JLD2
 # PODBasis struct, includes all the stuff we need to do sequential estimation
 struct PODBasis
     coeffs        :: Matrix{Float32}   # (?,?) - POD modal coefficients for all timesteps. as (rows=modes, cols=timesteps)
-    modes         :: Matrix{Float32}   # (state_dim, L) — W-orthonormal POD modes Pr_k (PrᵀWPr=I)
+    modes         :: Matrix{Float32}   # (state_dim, L) — orthonormal POD modes Pr_k (PrᵀPr=I)
     eigenvalues   :: Vector{Float64}   # (L,) descending in magnitude
-    L             :: Int               # length of eigenvalues/modes 
+    L             :: Int               # length of eigenvalues/modes
     n_snapshots   :: Int               # number of snapshots ()
     grid          :: GridInfo          # grid definition, see fasteddy_io.jl
     member_ids    :: Vector{String}    # ids of members used to build this basis, in column-block order
     truth_id      :: String            # id of the member held out / treated as truth for this basis
-    block_weights :: Vector{Float32}   # (3,) equal-energy component weights [w_u,w_v,w_w]; W = blkdiag(w_c I)
 end
-
-# --- Equal-energy component weighting -------------------------------------
-# The plain Euclidean POD norm ‖x‖² = Σu² + Σv² + Σw² lets the small-magnitude
-# vertical velocity be drowned out by the horizontal components, so the leading
-# modes barely resolve w. We instead use the W-inner product ⟨x,y⟩_W = xᵀWy with
-# a block-constant W = blkdiag(w_u·I, w_v·I, w_w·I). "Equal energy" fixes the
-# weights in closed form: w_c = 1/E_c, E_c = total snapshot energy in block c, so
-# each weighted block contributes unit energy. (Global scale of W is irrelevant.)
-# Modes become W-orthonormal (PrᵀWPr = I) but still reconstruct physical state
-# x = Prα; only the projection picks up a W: a = PrᵀWx (see `project`).
 
 # Optional in-RAM cache of member snapshot matrices, keyed by member id. When present,
 # `_member_snapshots` returns the cached matrix instead of re-reading from disk — this is
@@ -37,6 +26,17 @@ end
 # load_member_snapshots(member; t_spinup, domain), so all downstream POD arithmetic is
 # unchanged. The cache MUST have been built with the same t_spinup and domain.
 const SnapshotCache = Dict{String,Matrix{Float32}}
+
+# In-memory-only record of the full-pool snapshot Gram matrix C = X'X computed while
+# building a PODBasis (compute_pod_streaming's Pass 1). NEVER persisted to disk — it exists
+# so that, within one session, leave-one-out folds (heldout_residual_curve, build_rep_error)
+# can slice a member's rows/cols out of C and re-eigendecompose the (smaller) submatrix
+# instead of re-streaming O(M²) pairwise snapshot GEMMs per fold. See loo_basis_from_gram.
+struct PODGram
+    C          :: Matrix{Float64}   # (N,N) snapshot Gram matrix, member-block column order
+    member_ids :: Vector{String}    # (M,) block order matching C's column blocks
+    T          :: Int               # snapshots per member (columns per block)
+end
 
 _member_snapshots(member::MemberInfo, cache::Union{SnapshotCache,Nothing};
                   t_spinup::Float64, domain::AnalysisDomain) =
@@ -48,6 +48,7 @@ function load_member_cache(members::Vector{MemberInfo}, domain::AnalysisDomain;
     cache = SnapshotCache()
     for (i, m) in enumerate(members)
         @info "  Caching member $(m.id) ($i/$(length(members)))..."
+        flush(stderr)   # progress must survive an OOM SIGKILL (buffered stderr is lost)
         cache[m.id] = load_member_snapshots(m; t_spinup, domain)
     end
     gb = sum(length(v) for v in values(cache)) * 4 / 1e9
@@ -55,31 +56,9 @@ function load_member_cache(members::Vector{MemberInfo}, domain::AnalysisDomain;
     return cache
 end
 
-# Per-component block weights w_c = 1/E_c from one cheap pass over the members.
-function equal_energy_block_weights(members::Vector{MemberInfo}, domain::AnalysisDomain;
-                                    t_spinup::Float64,
-                                    cache::Union{SnapshotCache,Nothing}=nothing) :: Vector{Float32}
-    n = domain.n_grid
-    E = zeros(Float64, 3)
-    for member in members
-        X = _member_snapshots(member, cache; t_spinup, domain)   # (3n, T) Float32
-        for c in 1:3
-            E[c] += sum(abs2, Float64.(@view X[(c-1)*n+1 : c*n, :]))
-        end
-    end
-    return Float32.(1.0 ./ E)
-end
-
-# Expand 3 block weights into a length-state_dim column vector (u,v,w blocks).
-function _state_weight_vector(n::Int, w::Vector{Float32}) :: Vector{Float32}
-    vcat(fill(w[1], n), fill(w[2], n), fill(w[3], n))
-end
-_state_weight_vector(basis::PODBasis) = _state_weight_vector(size(basis.modes,1) ÷ 3, basis.block_weights)
-
-# Project physical state(s) onto the basis in the equal-energy W-inner product: a = PrᵀWx.
-# Use this anywhere coefficients are recovered from a state; raw `modes' * x` is only
-# correct for the unweighted (w=1) basis.
-project(basis::PODBasis, X::AbstractVecOrMat) = basis.modes' * (_state_weight_vector(basis) .* X)
+# Project physical state(s) onto the basis: a = Prᵀx. Use this anywhere coefficients
+# are recovered from a state.
+project(basis::PODBasis, X::AbstractVecOrMat) = basis.modes' * X
 
 # ---------------------------------------------------------------------------
 # Held-out residual-energy curve (leave-one-member-out cross-validation).
@@ -91,10 +70,10 @@ project(basis::PODBasis, X::AbstractVecOrMat) = basis.modes' * (_state_weight_ve
 # M-1 members, project member k's post-spinup snapshots onto it, and report the
 # fraction of k's energy left UNcaptured as a function of truncation rank r.
 #
-# Because the modes Pr are W-orthonormal, the whole curve comes from one projection
-# per held-out member (Parseval in the W-norm): with a = PrᵀWx and per-mode captured
+# Because the modes Pr are orthonormal, the whole curve comes from one projection
+# per held-out member (Parseval): with a = Prᵀx and per-mode captured
 # energy eᵢ = Σ_t a[i,t]², the residual fraction at rank r is
-#     E_resid(r) = 1 - (Σ_{i≤r} eᵢ) / Σ_t ‖x_t‖²_W ,   ‖x‖²_W = xᵀWx .
+#     E_resid(r) = 1 - (Σ_{i≤r} eᵢ) / Σ_t ‖x_t‖² .
 # The smallest r where E_resid(r) drops below the observation-noise floor is the
 # defensible truncation rank and quantifies the family-closure error.
 
@@ -131,7 +110,6 @@ function save_pod_basis(basis::PODBasis, filepath::String)
         grid_zPos     = basis.grid.zPos,
         member_ids    = basis.member_ids,
         truth_id      = basis.truth_id,
-        block_weights = basis.block_weights,
     )
     sz_gb = (size(basis.modes, 1) * size(basis.modes, 2) * 4) / 1e9
     @info "Saved POD basis to $filepath  (L=$(basis.L), modes ≈ $(round(sz_gb, digits=2)) GB)"
@@ -157,7 +135,6 @@ function load_pod_basis(filepath::String) :: PODBasis
         grid,
         d["member_ids"],
         d["truth_id"],
-        get(d, "block_weights", Float32[1, 1, 1]),   # legacy bases: unweighted
     )
 end
 
@@ -173,7 +150,7 @@ function build_pod_basis(config_path::String;
                           truth_id::Union{String,Nothing}=nothing,
                           margin_m::Float32=600f0,
                           spectrum_csv::Union{String,Nothing}=nothing,
-                          cache::Union{SnapshotCache,Nothing}=nothing) :: PODBasis
+                          cache::Union{SnapshotCache,Nothing}=nothing) :: Tuple{PODBasis,PODGram}
 
     config = load_ensemble_config(config_path; include_ids, exclude_ids)
 
@@ -201,32 +178,69 @@ function build_pod_basis(config_path::String;
     @info "  Analysis domain: $(grid.Nx - 2cx)×$(grid.Ny - 2cx)×$(grid.Nz) interior cells ($(margin_m) m margin), state_dim=$(domain.state_dim)"
 
     @info "Computing POD (L=$L, t_spinup=$(t_spinup) s)..."
-    basis = compute_pod_streaming(members, grid, domain; L, t_spinup, truth_id=resolved_truth_id, spectrum_csv, cache)
-    return basis
+    return compute_pod_streaming(members, grid, domain; L, t_spinup, truth_id=resolved_truth_id, spectrum_csv, cache)
 end
 
 # POD via Method of Snapshots (Sirovich 1987)
 # Avoids holding the full snapshot matrix in memory by re-reading members' blocks
 # from disk instead of caching them across passes. Pass 1 (Gram matrix) needs all
 # pairs Xi'Xj, so it re-reads Xj for each j<=i (O(M(M+1)/2) member loads total);
-# passes 2 and 3 (mode recovery, modal coefficients) need each member only once
-# (O(M) loads each). Trades extra disk I/O for peak memory usage 
+# Pass 2 (mode recovery) needs each member only once (O(M) loads). The modal
+# coefficients a = PrᵀX never need a third read: since Pr = X V_L Λ_L^{-1/2},
+# a = Pr'X = Λ_L^{-1/2}V_L'(X'X) = Λ_L^{-1/2}V_L'C = Λ_L^{1/2}V_L' (using CV_L=V_LΛ_L) —
+# pure linear algebra on quantities Pass 1 already produced.
 #
-# Peak memory: one Float32 member block (state_dim × T) + one Float64 copy of same
-#              + the (state_dim × L) mode matrix — never the full (state_dim × M*T) matrix,
-#              and never more than two members' data resident at once.
+# Peak memory: two Float32 member blocks (state_dim × T) + the bounded Float64 chunk
+#              buffers (2·GRAM_CHUNK_ROWS·T) + the (state_dim × L) mode matrix — never the
+#              full (state_dim × M*T) matrix, and never a full Float64 member copy.
 #
 # If a `cache` (member id → snapshot matrix) is supplied, member blocks are read from RAM
 # instead of disk. This is purely an I/O optimization: the cached matrices are identical to
 # load_member_snapshots output, so results match the streaming path exactly. Peak memory then
 # includes the cache (M·state_dim·T Float32) plus the same transient Float64 copies as before.
+#
+# Returns (basis, gram): `gram` is the full Gram matrix C = X'X, kept in memory (never
+# persisted) so leave-one-out folds can be sliced from it directly — see loo_basis_from_gram.
+
+# Rows converted to Float64 per chunk in _accum_gram_block!. Bounds Pass 1's transient
+# memory at 2·GRAM_CHUNK_ROWS·T·8 bytes regardless of state_dim.
+const GRAM_CHUNK_ROWS = 4_000_000
+
+# Accumulate the (T×T) Gram block Xiᵀ·Xj into `block` with Float64 arithmetic, WITHOUT
+# materializing Float64 copies of the full (state_dim×T) Float32 snapshot matrices:
+# convert one bounded row-chunk at a time into the preallocated buffers Abuf/Bbuf and let
+# BLAS accumulate. Same Float64 products/sums as `Float64.(Xi)' * Float64.(Xj)` up to
+# summation order. When Xi === Xj (diagonal block) the second conversion is skipped.
+function _accum_gram_block!(block::Matrix{Float64},
+                            Xi::AbstractMatrix{Float32}, Xj::AbstractMatrix{Float32},
+                            Abuf::Matrix{Float64}, Bbuf::Matrix{Float64})
+    fill!(block, 0.0)
+    s     = size(Xi, 1)
+    chunk = size(Abuf, 1)
+    for r0 in 1:chunk:s
+        r1 = min(r0 + chunk - 1, s)
+        nr = r1 - r0 + 1
+        A  = view(Abuf, 1:nr, :)
+        copyto!(A, view(Xi, r0:r1, :))
+        B  = if Xi === Xj
+            A
+        else
+            Bv = view(Bbuf, 1:nr, :)
+            copyto!(Bv, view(Xj, r0:r1, :))
+            Bv
+        end
+        mul!(block, A', B, 1.0, 1.0)
+    end
+    return block
+end
+
 function compute_pod_streaming(members::Vector{MemberInfo}, grid::GridInfo,
                                 domain::AnalysisDomain;
                                 L::Int=10,
                                 t_spinup::Float64=900.0,
                                 truth_id::String="",
                                 spectrum_csv::Union{String,Nothing}=nothing,
-                                cache::Union{SnapshotCache,Nothing}=nothing) :: PODBasis
+                                cache::Union{SnapshotCache,Nothing}=nothing) :: Tuple{PODBasis,PODGram}
     M     = length(members)
     T_vec = [sum(_spinup_mask(m, t_spinup)) for m in members]
     @assert all(==(T_vec[1]), T_vec) "Members have unequal post-spinup snapshot counts: $T_vec"
@@ -234,25 +248,26 @@ function compute_pod_streaming(members::Vector{MemberInfo}, grid::GridInfo,
     N = M * T
     L = min(L, N)
 
-    # --- Equal-energy component weighting (so vertical velocity isn't starved) ---
-    # Work in the transformed coordinate set
-    @info "  Computing equal-energy block weights..."
-    bw   = equal_energy_block_weights(members, domain; t_spinup, cache)    # [w_u,w_v,w_w]
-    sw   = sqrt.(_state_weight_vector(domain.n_grid, bw))                  # (state_dim,) Float32
-    sw64 = Float64.(sw)
-    @info "    block weights (u,v,w) = $(bw)"
-
-    # --- Pass 1: build Gram matrix C = X̃'X̃ = X'WX, one member at a time ---
+    # --- Pass 1: build Gram matrix C = X'X, one member at a time ---
+    # The Float64 promotion needed for accurate T×T blocks happens a bounded row-chunk at a
+    # time in preallocated buffers: peak transient is 2·chunk·T·8 bytes independent of
+    # state_dim, so Pass 1 adds only ~2·chunk·T·8 on top of the Float32 cache instead of
+    # two full state_dim×T Float64 member copies per pair.
     @info "  Pass 1/2: building $(N)×$(N) Gram matrix (streaming over $M members)..."
     C = zeros(Float64, N, N)
+    chunk = min(GRAM_CHUNK_ROWS, domain.state_dim)
+    Abuf  = Matrix{Float64}(undef, chunk, T)
+    Bbuf  = Matrix{Float64}(undef, chunk, T)
+    block = Matrix{Float64}(undef, T, T)
     for (mi, member) in enumerate(members)
         @info "    Loading member $(member.id) ($(mi)/$M)..."
-        Xi64 = Float64.(_member_snapshots(member, cache; t_spinup, domain)) .* sw64   # x̃ (state_dim, T)
+        flush(stderr)
+        Xi = _member_snapshots(member, cache; t_spinup, domain)   # (state_dim, T) Float32
         col_i = (mi-1)*T+1 : mi*T
         for mj in 1:mi
-            Xj64 = mj == mi ? Xi64 : Float64.(_member_snapshots(members[mj], cache; t_spinup, domain)) .* sw64
+            Xj = mj == mi ? Xi : _member_snapshots(members[mj], cache; t_spinup, domain)
             col_j = (mj-1)*T+1 : mj*T
-            block = Xi64' * Xj64                        # (T×T) — small
+            _accum_gram_block!(block, Xi, Xj, Abuf, Bbuf)         # (T×T) — small
             C[col_i, col_j] = block
             if mi != mj
                 C[col_j, col_i] = block'
@@ -282,30 +297,83 @@ function compute_pod_streaming(members::Vector{MemberInfo}, grid::GridInfo,
     V_L = V[:, 1:L]                                    # (N, L)
     scale = Diagonal(1.0 ./ sqrt.(λ_L))               # (L, L)
 
-    # --- Pass 2: recover whitened truncated modes Pr̃ = X̃ V_L scale, then unscale Pr = Pr̃/√W ---
+    # --- Pass 2: recover truncated modes Pr = X V_L scale ---
     @info "  Pass 2/2: recovering $L POD modes (state_dim=$(domain.state_dim))..."
     state_dim = domain.state_dim
-    Pr̃ = zeros(Float32, state_dim, L)
-    for (mi, member) in enumerate(members)
-        X̃ = _member_snapshots(member, cache; t_spinup, domain) .* sw   # x̃ (state_dim, T) Float32
-        col_i = (mi-1)*T+1 : mi*T
-        Pr̃ .+= Float32.(Float64.(X̃) * (V_L[col_i, :] * scale))
-    end
-    Pr = Pr̃ ./ sw                                                     # W-orthonormal physical modes
-
-    # --- Modal coefficients a = PrᵀWX = Pr̃ᵀX̃ (streaming) ---
-    @info "  Computing modal coefficients..."
-    wv = _state_weight_vector(domain.n_grid, bw)                    # W diagonal (state_dim,)
-    a = Matrix{Float32}(undef, L, N)
+    Pr = zeros(Float32, state_dim, L)
     for (mi, member) in enumerate(members)
         Xi = _member_snapshots(member, cache; t_spinup, domain)   # (state_dim, T) Float32
         col_i = (mi-1)*T+1 : mi*T
-        a[:, col_i] = Pr' * (wv .* Xi)
+        W = Float32.(V_L[col_i, :] * scale)                       # (T, L) — small
+        mul!(Pr, Xi, W, true, true)                               # Pr .+= Xi*W, no state-size temporaries
     end
+
+    # --- Modal coefficients a = PrᵀX = Λ_L^{1/2}V_Lᵀ (exact identity — no reread) ---
+    a = Float32.(Diagonal(sqrt.(λ_L)) * V_L')                    # (L, N)
 
     @info "  POD complete: L=$L, N=$N snapshots"
     member_ids = [m.id for m in members]
-    return PODBasis(a, Pr, λ_L, L, N, grid, member_ids, truth_id, bw)
+    basis = PODBasis(a, Pr, λ_L, L, N, grid, member_ids, truth_id)
+    gram  = PODGram(C, member_ids, T)
+    return basis, gram
+end
+
+# Build a leave-one-out POD basis for `held_id` directly from an already-computed full-pool
+# Gram matrix `gram`, by slicing that member's rows/cols out and re-eigendecomposing the
+# (smaller) submatrix — skipping Pass 1 of compute_pod_streaming entirely, since its O(M²)
+# pairwise state_dim-length GEMMs are exactly the work `gram` already paid for once when the
+# full-pool basis was built. Only the "other" members' physical snapshots are touched (mode
+# recovery, one read each via `cache` if supplied); their modal coefficients come for free
+# from the same Λ^{1/2}Vᵀ identity used in compute_pod_streaming — no reread needed there either.
+# Slice a member's rows/cols out of a full-pool Gram matrix, returning a smaller PODGram
+# over the remaining members. Reused both by loo_basis_from_gram (to eigendecompose the
+# reduced pool) and by nested leave-one-out (e.g. build_rep_error's inner folds), so a
+# fold's own Gram matrix never needs to be re-streamed from disk — it's already a
+# principal submatrix of the pool-level Gram that was paid for once.
+function gram_slice(gram::PODGram, held_id::String) :: PODGram
+    held_pos = findfirst(==(held_id), gram.member_ids)
+    isnothing(held_pos) && error("held_id '$held_id' not found in gram.member_ids")
+    other_ids = [id for (i, id) in enumerate(gram.member_ids) if i != held_pos]
+
+    T  = gram.T
+    N  = length(gram.member_ids) * T
+    held_cols  = (held_pos-1)*T+1 : held_pos*T
+    other_cols = setdiff(1:N, held_cols)
+
+    return PODGram(gram.C[other_cols, other_cols], other_ids, T)
+end
+
+function loo_basis_from_gram(gram::PODGram, members::Vector{MemberInfo}, grid::GridInfo,
+                              domain::AnalysisDomain;
+                              held_id::String, L::Int, t_spinup::Float64,
+                              cache::Union{SnapshotCache,Nothing}=nothing) :: PODBasis
+    id2m = Dict(m.id => m for m in members)
+    sub    = gram_slice(gram, held_id)
+    other_ids = sub.member_ids
+    T = sub.T
+
+    decomp = eigen(Symmetric(sub.C))
+    λ = reverse(decomp.values)
+    V = reverse(decomp.vectors, dims=2)
+
+    valid   = λ .> 1e-10 * λ[1]
+    n_valid = sum(valid)
+    L_k = min(L, n_valid)
+    λ_L = λ[1:L_k]
+    V_L = V[:, 1:L_k]
+    scale = Diagonal(1.0 ./ sqrt.(λ_L))
+
+    state_dim = domain.state_dim
+    Pr = zeros(Float32, state_dim, L_k)
+    for (mi, oid) in enumerate(other_ids)
+        Xi = _member_snapshots(id2m[oid], cache; t_spinup, domain)   # (state_dim, T)
+        rows = (mi-1)*T+1 : mi*T
+        W = Float32.(V_L[rows, :] * scale)                           # (T, L_k) — small
+        mul!(Pr, Xi, W, true, true)                                  # Pr .+= Xi*W, no state-size temporaries
+    end
+
+    a = Float32.(Diagonal(sqrt.(λ_L)) * V_L')     # (L_k, (M-1)*T) — free, no reread
+    return PODBasis(a, Pr, λ_L, L_k, length(other_ids)*T, grid, other_ids, held_id)
 end
 
 # Compute the held-out residual-energy curve over the chosen prior members.
@@ -349,40 +417,36 @@ function heldout_residual_curve(config_path::String;
             load_member_cache(config.prior_members, domain; t_spinup)
         end : nothing
 
+    # Build the full-pool Gram matrix ONCE; every fold below slices it instead of paying
+    # Pass 1's O(M²) pairwise GEMMs again — see loo_basis_from_gram.
+    @info "Building full-pool Gram matrix once (shared across all $M leave-one-out folds)..."
+    _, gram = compute_pod_streaming(config.prior_members, grid, domain; L, t_spinup, truth_id="", cache)
+
     resid_per_mbr = fill(NaN, L, M)
     total_energy  = zeros(Float64, M)
 
     for (k, held) in enumerate(ids)
-        # Build (or load) the leave-one-out basis. truth_id=held makes build_pod_basis
-        # drop the held member and tag the file as its truth basis.
+        # Build (or load) the leave-one-out basis. truth_id=held tags the fold as the
+        # basis for assimilating k as truth (matches build_pod_basis's convention).
         basis_file = isnothing(basis_dir) ? nothing : basis_filename(basis_dir, held)
         if !isnothing(basis_file) && reuse && isfile(basis_file)
             @info "  Fold $k/$M: reusing saved basis for held-out member $held ($basis_file)"
             basis = load_pod_basis(basis_file)
         else
-            @info "  Fold $k/$M: holding out member $held, building basis from the other $(M-1)..."
-            basis = build_pod_basis(config_path;
-                L           = L,
-                t_spinup    = t_spinup,
-                include_ids = member_ids,
-                exclude_ids = exclude_ids,
-                truth_id    = held,
-                margin_m    = margin_m,
-                cache       = cache,
-            )
+            @info "  Fold $k/$M: holding out member $held (Gram-matrix slice, no full rebuild)..."
+            basis = loo_basis_from_gram(gram, config.prior_members, grid, domain;
+                                         held_id=held, L, t_spinup, cache)
             isnothing(basis_file) || save_pod_basis(basis, basis_file)
         end
 
         held_member = config.prior_members[k]
         X = _member_snapshots(held_member, cache; t_spinup, domain)   # (state_dim, T) Float32
-        # Energy in the basis's W-norm (Parseval holds for W-orthonormal modes):
-        # total = Σ_t xᵀWx, captured = Σ a². Use the fold's own block weights.
-        n  = domain.n_grid
-        total = sum(basis.block_weights[c] * sum(abs2, Float64.(@view X[(c-1)*n+1 : c*n, :])) for c in 1:3)
+        # Energy (Parseval holds for orthonormal modes): total = Σ_t xᵀx, captured = Σ a².
+        total = sum(abs2 ∘ Float64, X)   # Float64 accumulation, no state-size copy
         total_energy[k] = total
 
         # Project in Float32 (as compute_pod_streaming does), accumulate energy in Float64.
-        a = project(basis, X)                                      # (L_k, T) Float32, a = PrᵀWx
+        a = project(basis, X)                                      # (L_k, T) Float32, a = Prᵀx
         e_mode = vec(sum(abs2, Float64.(a); dims=2))               # (L_k,) captured energy per mode
         captured = cumsum(e_mode)                                  # (L_k,)
         L_k = length(e_mode)

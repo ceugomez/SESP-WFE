@@ -24,12 +24,11 @@ function get_measurement_sequence(U::NCfield, grid::GridInfo, domain::AnalysisDo
 end
 
 # set of static location measurements for every timestep
-function get_static_measurement_sequence(U::NCField, grid::GridInfo, locations::Vector{Vector{Float32}}, domain::AnalysisDomain, nm::Int, mvar::Matrix{Float32}, tidx::Vector{Int})::Vector{measSet}
-	# samples a set of nm measurements in static locationsacross the U truth field
-	# for every timestep in 
-
-
-
+function get_static_measurement_sequence(U::NCfield, grid::GridInfo, locations::Vector{Vector{Float32}}, domain::AnalysisDomain, nm::Int, mvar::Matrix{Float32}, tidx::Vector{Int})::Vector{measSet}
+	# samples measurements at the same fixed `locations` (length nm) across the U truth field
+	# for every timestep in tidx
+	length(locations) == nm || error("expected $nm static locations, got $(length(locations))")
+	return [get_measurement_set(U, grid, locations, mvar, t) for t in tidx]
 end
 
 
@@ -114,6 +113,49 @@ function get_flighttrack_sequence(U::NCfield, grid::GridInfo, domain::AnalysisDo
     return seq
 end
 
+# Transiting observer: ONE point sensor at fixed x and fixed height AGL, translating up
+# and down along y as a triangle wave between y_lo and y_hi at constant ground speed.
+# Returns one measSet (a single measurement) per entry of tidx, so each filter update sees
+# 3 rows. The sensor snaps to the nearest grid cell at each step (cell size 10 m vs ~90 m
+# of travel per 6 s step, so the snap is a sub-step detail).
+#
+# Height is held at z_agl_m ABOVE GROUND, re-resolved per position, because the sigma
+# coordinate rides the terrain — a fixed absolute z would change its height above ground
+# as it crosses the hill's flank.
+#
+# `times` must be the simulation times (s) of the FULL post-spinup record, i.e. the same
+# vector tidx indexes into; the phase is measured from times[tidx[1]].
+#
+# NOTE on representativeness: with one sensor per update, build_rep_covariance collapses to
+# diag(σ²_u,σ²_v,σ²_w) at the sensor cell and the L∥/L⊥/θ kernel is never read (see
+# reconstruction_error.md, final note). This sidesteps the non-PSD kernel entirely, but it
+# does NOT make the rep error white — successive samples along the track remain correlated
+# in space and time, and the filter treats them as independent. Motion decorrelates faster
+# than a static sensor at the same cadence, but the over-counting bias is real: expect NIS
+# below 1 at short cadence.
+function get_transect_sequence(U::NCfield, grid::GridInfo, domain::AnalysisDomain,
+                               mvar::Matrix{Float32}, tidx::Vector{Int}, times::Vector{Float32};
+                               x_m::Float32, z_agl_m::Float32,
+                               y_lo::Float32, y_hi::Float32,
+                               speed_ms::Float32) :: Tuple{Vector{measSet},Vector{Vector{Float32}}}
+    y_hi > y_lo || error("transect needs y_hi > y_lo, got y_lo=$y_lo y_hi=$y_hi")
+    span = y_hi - y_lo
+    t0   = times[tidx[1]]
+    seq  = Vector{measSet}(undef, length(tidx))
+    locs = Vector{Vector{Float32}}(undef, length(tidx))
+    for (m, t) in enumerate(tidx)
+        # triangle wave: travel s along a path that folds back at each end
+        s = speed_ms * (times[t] - t0)
+        u = mod(s, 2span)
+        y = u <= span ? y_lo + u : y_hi - (u - span)
+        i, j, k = nearest_cell(grid, domain, x_m, y, z_agl_m)
+        loc = Float32[grid.xPos[i,j,k], grid.yPos[i,j,k], grid.zPos[i,j,k]]
+        locs[m] = loc
+        seq[m]  = get_measurement_set(U, grid, [loc], mvar, t)
+    end
+    return seq, locs
+end
+
 # ---------- KF measurement model in POD space ----------
 # State vector packing (see fasteddy_io.jl unpack_snapshot): x = [u;v;w], each block of
 # length n = domain.n_grid, ordered by column-major linear index over the masked cells.
@@ -125,10 +167,10 @@ function _masked_linear_index(domain::AnalysisDomain, grid::GridInfo)::Array{Int
 end
 
 # Build the measurement operator H (3*nm × L) mapping POD coefficients α to predicted
-# measurements y = H α. Each sensor contributes 3 rows (u,v,w), taken from the Φ rows at
+# measurements y = H α. Each sensor contributes 3 rows (u,v,w), taken from the Pr (mode) rows at
 # that sensor's state indices [p, n+p, 2n+p]. Sensors outside the analysis domain error.
 function build_measurement_operator(ms::measSet, basis::PODBasis, domain::AnalysisDomain)::Matrix{Float32}
-	Φ   = basis.modes                       # (domain.state_dim, L)
+	Pr   = basis.modes                       # (domain.state_dim, L)
 	n   = domain.n_grid
 	lin = _masked_linear_index(domain, basis.grid)
 	nm  = length(ms.measurements)
@@ -136,9 +178,9 @@ function build_measurement_operator(ms::measSet, basis::PODBasis, domain::Analys
 	for (k, m) in enumerate(ms.measurements)
 		p = lin[m.locidx[1], m.locidx[2], m.locidx[3]]
 		p == 0 && error("sensor $k at grid index $(m.locidx) lies outside the analysis domain")
-		H[3k-2, :] = Φ[p,       :]          # u
-		H[3k-1, :] = Φ[n+p,     :]          # v
-		H[3k,   :] = Φ[2n+p,    :]          # w
+		H[3k-2, :] = Pr[p,       :]          # u
+		H[3k-1, :] = Pr[n+p,     :]          # v
+		H[3k,   :] = Pr[2n+p,    :]          # w
 	end
 	return H
 end

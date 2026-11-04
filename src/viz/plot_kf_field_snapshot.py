@@ -2,7 +2,7 @@
 """Plot the filter's actual reconstructed wind field at one snapshot, vs truth, oracle
 (truth-projected), and the ensemble-mean prior. Answers: does the estimate carry the wake
 deficit, or just the bulk wind? Reads results/fields/kf_field_snapshot_truth_<ID>.nc."""
-import os, sys, numpy as np, netCDF4 as nc, matplotlib
+import argparse, os, numpy as np, netCDF4 as nc, matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -10,7 +10,13 @@ _HERE   = os.path.dirname(os.path.abspath(__file__))
 FIELDS  = os.path.normpath(os.path.join(_HERE, "..", "..", "results", "fields"))
 FIGURE  = os.path.normpath(os.path.join(_HERE, "..", "..", "figure"))
 
-ID  = sys.argv[1] if len(sys.argv) > 1 else "truth"
+p = argparse.ArgumentParser()
+p.add_argument("id", nargs="?", default="truth")
+p.add_argument("--level-step", type=float, default=0.5, help="contour level spacing for speed panels (m/s)")
+p.add_argument("--level-step-diff", type=float, default=0.25, help="contour level spacing for increment/error panels (m/s)")
+args = p.parse_args()
+
+ID = args.id
 src = os.path.join(FIELDS, f"kf_field_snapshot_truth_{ID}.nc")
 d   = nc.Dataset(src)
 x = d["xPos"][:] / 1000.0; y = d["yPos"][:] / 1000.0          # km
@@ -39,8 +45,16 @@ panels = [("truth  x*", truth, vmin, vmax, "viridis"),
 
 for a, (title, F, lo, hi, cmap) in zip(ax.flat, panels):
     if lo is None:
-        m = np.nanpercentile(np.abs(F), 99); lo, hi = -m, m
-    pc = a.pcolormesh(x, y, F.T, shading="auto", vmin=lo, vmax=hi, cmap=cmap)
+        step = args.level_step_diff
+        m = np.ceil(np.nanpercentile(np.abs(F), 99) / step) * step
+        lo, hi = -m, m
+        levels = np.arange(lo, hi + step, step)
+    else:
+        step = args.level_step
+        lo = np.floor(lo / step) * step; hi = np.ceil(hi / step) * step
+        levels = np.arange(lo, hi + step, step)
+    pc = a.contourf(x, y, F.T, levels=levels, vmin=lo, vmax=hi, cmap=cmap, extend="both")
+    a.contour(x, y, F.T, levels=levels[::2], colors="k", linewidths=0.3, alpha=0.5)
     fig.colorbar(pc, ax=a, shrink=0.85, label="speed (m/s)")
     if sxyz is not None:
         a.scatter(sxyz[:, 0], sxyz[:, 1], c="k", marker="*", s=180,
