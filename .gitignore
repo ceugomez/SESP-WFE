@@ -3,3 +3,11 @@ outputs/*
 doc/*
 log/*
 __pycache__/*
+*.jld2
+*.log
+
+**/__pycache__/
+# generated outputs / archives (2026-11-20)
+oneoff/**/out_*/
+.removed_results_*/
+.removed_code_*/

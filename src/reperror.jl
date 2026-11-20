@@ -2,7 +2,6 @@
 # cgf cego6160@colorado.edu 6.25.26
 #
 # Representativeness (reconstruction-error) model for the reduced-order filter.
-# See paper-drafts/reconstruction_error.md.
 #
 # The rank-r subspace cannot represent an UNSEEN turbulent realization exactly; the
 # unrepresented part is a state-space error that the filter must account for as an
@@ -17,13 +16,17 @@
 #   Ĉ_rep(ζ₁,ζ₂) = σ_rep(ζ₁) σ_rep(ζ₂) ρ(s),  s = ‖rotate(Δ)/L‖,  ρ = e^{-s} (or e^{-s²})
 #
 # σ²/L∥/L⊥ are estimated by LEAVE-ONE-MEMBER-OUT cross-validation over the basis's
-# training pool (the same fold structure as heldout_residual_curve in pod.jl, and the
-# same saved truth_<id>_basis.jld2 fold bases are reused when present): for each held-out
-# member k, build a basis from the OTHER members and project k onto it — r_t = x_t − Pr_{-k}
+# training pool (the same fold structure as heldout_residual_curve in pod.jl): for each
+# held-out member k, build a basis from the OTHER members and project k onto it — r_t = x_t − Pr_{-k}
 # a_t with a_t = Pr_{-k}ᵀ x_t — so the residual is always measured on a realization the
 # fold's basis never saw, not on the training members' own (in-sample, lower) truncation
 # error. Accumulating over all folds and dividing by total snapshot count averages over the
 # M held-out members. The real truth member is never in this pool — no leakage.
+#
+# NESTING: for a fold basis built on M−1 members, the inner folds here are (M−2)-member bases.
+# They are NOT the outer fold bases in BASES_DIR (truth_<j>_basis.jld2 holds out only j, so it
+# CONTAINS the fold's truth). Never pass basis_dir=BASES_DIR for a fold basis: the inner
+# folds would load bases containing the truth (leakage) and overwrite the outer ones.
 # θ (a mean-flow property, not a residual) is read once from the primary (all-prior) basis.
 
 include("pod.jl")          # PODBasis, GridInfo, AnalysisDomain, unpack_snapshot
@@ -32,6 +35,7 @@ include("measurement.jl")  # measSet, _masked_linear_index (build_rep_covariance
 using LinearAlgebra
 using Statistics
 using JLD2
+using Printf
 
 struct RepError
     σ²       :: Vector{Float64}    # (state_dim,) per-cell residual variance, [u;v;w] masked layout
@@ -62,9 +66,9 @@ end
 # same session. `gram` is in-memory only (never persisted), so a caller that only *loaded*
 # `basis` from disk won't have one; pass `config_path` in that case and a fold that isn't
 # already cached in `basis_dir` falls back to a full build_pod_basis rebuild.
-# If `basis_dir` is given, fold bases are saved as truth_<held>_basis.jld2 and reused on
-# re-runs — the same files/convention heldout_residual_curve uses, so running that first (or
-# this) populates the cache for both. `cache`, if supplied, is a SnapshotCache (see
+# If `basis_dir` is given, inner-fold bases are saved there as truth_<held>_basis.jld2 and
+# reused on re-runs. Only safe for a basis whose pool is the full prior (fold "truth");
+# see NESTING in the header. `cache`, if supplied, is a SnapshotCache (see
 # load_member_cache) threaded into any fold that must be rebuilt, to avoid re-reading members
 # from disk O(M²) times.
 function build_rep_error(basis::PODBasis, members::Vector{MemberInfo}, domain::AnalysisDomain;
@@ -327,6 +331,8 @@ end
 
 # Flow-aligned anisotropic correlation between two sensor locations, using θ, L∥, L⊥
 # evaluated at the midpoint cell (the separation vector lives between the two points).
+# With spatially varying θ/L this is NOT a valid covariance (Paciorek & Schervish 2006):
+# R_rep can be indefinite; see check_R_pd in experiment.jl.
 function _pair_correlation(la::Vector{Float32}, lb::Vector{Float32},
                            ia::NTuple{3,Int}, ib::NTuple{3,Int}, rep::RepError) :: Float64
     Δx = Float64(lb[1] - la[1]); Δy = Float64(lb[2] - la[2]); Δz = Float64(lb[3] - la[3])
@@ -369,4 +375,151 @@ function load_rep_error(filepath::String) :: RepError
                     d["grid_xPos"], d["grid_yPos"], d["grid_zPos"], Nx*Ny*Nz, 3*Nx*Ny*Nz)
     return RepError(d["σ²"], d["θ"], d["L_par"], d["L_perp"], d["L_z"],
                     Symbol(d["kernel"]), grid, d["n_grid"])
+end
+
+# ===========================================================================
+# LOW-RANK + DIAGONAL representativeness model (RepErrorLR, 2026-11-20)
+# ===========================================================================
+# Replaces the parametric kernel above for the lowvar paper runs. Motivation (oneoff
+# lowvar_partial_kf_2026-11-10/run_rep_lowrank.jl, job 24745): the midpoint-parameter kernel is
+# indefinite (15/45 negative eigenvalues on the rake, min ≈ −0.03 m²/s²); at σ_sensor = 0.1 m/s
+# that is no longer masked and the POD-KF became badly over-confident (NIS 2.9, coeff z² 7.4).
+# With this model: NIS 0.65, z² 1.2, RMSE 0.104 → 0.096 (r=10, all-11 pool, nature-run truth).
+#
+# Same leave-one-member-out fold structure (and the same NESTING rule) as build_rep_error, but
+# nothing is parameterized. For basis rank r and each held-out member k of the basis's pool:
+#     ℛ_{k,t} = x_{k,t} − Φ_{-k,1:r} Φ_{-k,1:r}ᵀ x_{k,t}         (rank-r out-of-sample residual)
+# Stack all N = Σ_k T_k residuals as ℛ (d × N). With the uncentered second moment C = ℛℛᵀ/N
+# (as σ² above) and the N×N Gram ℛᵀℛ = VΛVᵀ:
+#     F = ℛ V_q / √N   (d × q),     nugget = diag C − rowsum(F²) ≥ 0
+#     R_rep(sensors) = F_s F_sᵀ + diag(nugget_s)                   ⪰ 0 by construction
+# The nugget restores the exact per-cell variance the q modes miss. The residual spectrum is
+# broadband (q = 50 captures ~50% of the energy on lowvar); filter results were flat in q from
+# 10 to 737, so q = 50 is ample. Any sensor geometry (rake, lattice, transect) is row indexing.
+#
+# RANK-MATCHED: the residual is taken against the leading r modes, so the model already holds
+# the error of the discarded tail r+1:L. Do NOT add tail_clutter on top — use rank_r_obs
+# (kf_adapters.jl), which skips it for a RepErrorLR and checks rep.rank == r.
+
+struct RepErrorLR
+    F          :: Matrix{Float32}   # (state_dim, q) residual-covariance factor
+    nugget     :: Vector{Float32}   # (state_dim,) per-cell variance not in F (≥ 0)
+    rank       :: Int               # basis rank r the residual is taken against
+    q          :: Int               # number of residual modes kept
+    eig        :: Vector{Float64}   # all N residual Gram eigenvalues / N (the residual spectrum)
+    member_ids :: Vector{String}    # pool the LOO folds ran over (= basis.member_ids)
+    n_grid     :: Int               # domain.n_grid — consistency guard
+end
+
+# Rank-r LOO residuals of every held-out member, for rows `ch`, written into R (|ch| × N).
+function _lr_fill_residual!(R, ch, r, ids, offs, X, Φ, A)
+    for (i, id) in enumerate(ids)
+        blk = offs[i]+1 : offs[i+1]
+        R[:, blk] .= view(X[id], ch, :)
+        mul!(view(R, :, blk), view(Φ[id], ch, 1:r), view(A[id], 1:r, :), -1f0, 1f0)
+    end
+    return R
+end
+
+"""
+    build_rep_error_lowrank(basis, members, domain; gram, cache, ranks=[basis.L], q=50,
+                            t_spinup=900.0, rowchunk=2^18) -> Dict{Int,RepErrorLR}
+
+One RepErrorLR per rank in `ranks`, from a single set of inner LOO fold bases (built once at
+max(ranks) via the Gram slice and truncated per rank). `gram` must be the basis's OWN pool
+Gram (the pool Gram for fold "truth", `gram_slice(pool_gram, k)` for fold k) — see NESTING in
+the header; `cache` must hold every pool member (residuals are formed twice per rank, by row
+chunk, so ℛ itself is never stored). Peak extra memory ≈ M fold bases of size d × max(ranks).
+"""
+function build_rep_error_lowrank(basis::PODBasis, members::Vector{MemberInfo}, domain::AnalysisDomain;
+                                 gram::PODGram, cache::SnapshotCache,
+                                 ranks::Vector{Int}=[basis.L], q::Int=50,
+                                 t_spinup::Float64=900.0, rowchunk::Int=1 << 18) :: Dict{Int,RepErrorLR}
+    grid = basis.grid
+    n    = domain.n_grid
+    d    = 3n
+    d == size(basis.modes, 1) ||
+        error("domain.state_dim=$d ≠ basis state_dim=$(size(basis.modes,1)); margin_m mismatch")
+    ids = basis.member_ids
+    sort(gram.member_ids) == sort(ids) ||
+        error("gram pool $(gram.member_ids) ≠ basis pool $ids: pass the fold's OWN Gram (NESTING)")
+    rmax = maximum(ranks)
+    all(r -> 1 <= r, ranks) || error("ranks must be ≥ 1, got $ranks")
+    id2m = Dict(m.id => m for m in members)
+
+    Φ = Dict{String,Matrix{Float32}}()     # inner fold bases (d × rmax)
+    A = Dict{String,Matrix{Float32}}()     # held-out member's coefficients (rmax × T_k)
+    X = Dict{String,Matrix{Float32}}()     # held-out member's snapshots (cache references)
+    for (mi, held) in enumerate(ids)
+        @info "  RepErrorLR: inner fold $mi/$(length(ids)), held-out member $held (rank $rmax)"
+        b = loo_basis_from_gram(gram, members, grid, domain; held_id=held, L=rmax, t_spinup, cache)
+        b.L == rmax || error("inner fold $held has only $(b.L) valid modes < rank $rmax")
+        X[held] = _member_snapshots(id2m[held], cache; t_spinup, domain)
+        Φ[held] = b.modes
+        A[held] = b.modes' * X[held]
+        b = nothing; GC.gc()
+    end
+    offs = cumsum([0; [size(X[id], 2) for id in ids]])
+    N    = offs[end]
+    qq   = min(q, N)
+    Rc   = Matrix{Float32}(undef, rowchunk, N)
+    out  = Dict{Int,RepErrorLR}()
+    for r in sort(unique(ranks))
+        # pass 1: residual Gram + per-cell second moment
+        G  = zeros(Float64, N, N)
+        Gc = Matrix{Float32}(undef, N, N)
+        diagC = zeros(Float64, d)
+        for ch in Iterators.partition(1:d, rowchunk)
+            R = _lr_fill_residual!(view(Rc, 1:length(ch), :), ch, r, ids, offs, X, Φ, A)
+            mul!(Gc, R', R); G .+= Gc
+            diagC[ch] .= vec(sum(abs2, R; dims=2)) ./ N
+        end
+        eg = eigen(Symmetric((G + G') ./ 2); sortby = -)
+        λ  = max.(eg.values, 0.0)
+        W  = Float32.(eg.vectors[:, 1:qq] ./ sqrt(N))
+        # pass 2: F = ℛ V_q / √N and the nugget
+        F   = Matrix{Float32}(undef, d, qq)
+        nug = Vector{Float32}(undef, d)
+        for ch in Iterators.partition(1:d, rowchunk)
+            R  = _lr_fill_residual!(view(Rc, 1:length(ch), :), ch, r, ids, offs, X, Φ, A)
+            Fc = view(F, ch, :)
+            mul!(Fc, R, W)
+            nug[ch] .= Float32.(max.(diagC[ch] .- vec(sum(abs2, Float64.(Fc); dims=2)), 0.0))
+        end
+        @info @sprintf("  RepErrorLR rank %d: N=%d, q=%d captures %.1f%% of residual energy, mean var %.4f m²/s²",
+                       r, N, qq, 100 * sum(λ[1:qq]) / sum(λ), mean(diagC))
+        out[r] = RepErrorLR(F, nug, r, qq, λ ./ N, collect(ids), n)
+    end
+    return out
+end
+
+"R_rep (3nm × 3nm) at a measurement set from the low-rank + diagonal model; PSD by construction."
+function build_rep_covariance(ms::measSet, rep::RepErrorLR, domain::AnalysisDomain) :: Matrix{Float32}
+    n = domain.n_grid
+    n == rep.n_grid || error("RepErrorLR n_grid=$(rep.n_grid) ≠ domain.n_grid=$n")
+    lin  = zeros(Int, size(domain.mask)); lin[domain.mask] = 1:n   # = _masked_linear_index
+    rows = Int[]
+    for (k, m) in enumerate(ms.measurements)
+        p = lin[m.locidx...]
+        p == 0 && error("sensor $k at $(m.locidx) is outside the analysis domain")
+        append!(rows, (p, n + p, 2n + p))                  # [u;v;w] per sensor, as H
+    end
+    Fs = Float64.(rep.F[rows, :])
+    R  = Fs * Fs' + Diagonal(Float64.(rep.nugget[rows]))
+    return Float32.((R + R') ./ 2)
+end
+
+function rep_error_lr_filename(output_dir::String, truth_id::String, rank::Int) :: String
+    return joinpath(output_dir, "rep_error_lr_truth_$(truth_id)_r$(rank).jld2")
+end
+
+function save_rep_error_lr(rep::RepErrorLR, filepath::String)
+    jldsave(filepath; F=rep.F, nugget=rep.nugget, rank=rep.rank, q=rep.q, eig=rep.eig,
+            member_ids=rep.member_ids, n_grid=rep.n_grid)
+    @info "Saved RepErrorLR (rank $(rep.rank), q $(rep.q)) to $filepath"
+end
+
+function load_rep_error_lr(filepath::String) :: RepErrorLR
+    d = load(filepath)
+    return RepErrorLR(d["F"], d["nugget"], d["rank"], d["q"], d["eig"], d["member_ids"], d["n_grid"])
 end

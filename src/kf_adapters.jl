@@ -1,13 +1,14 @@
 # kf_adapters.jl
 # cgf cego6160@colorado.edu 6.19.26
-include("fasteddy_io.jl") # include IO
-include("pod.jl")         # include POD structs (before measurement: it annotates ::PODBasis)
-include("measurement.jl") # include measurement
-include("statmodel.jl")   # include prior/process-noise models
-include("reperror.jl")    # include representativeness (reconstruction-error) model
-
-using LinearAlgebra
-
+#
+# Glue between the SESP-WFE structs (PODBasis, models, measSet, RepError) and the pure
+# filter in kalman.jl, plus saving filter histories and their error diagnostics.
+# Including this file loads the whole library except experiment.jl / regions.jl.
+include("fasteddy_io.jl")  # IO, grid, analysis domain
+include("pod.jl")          # POD structs (before measurement: it annotates ::PODBasis)
+include("measurement.jl")  # synthetic observations, H
+include("statmodel.jl")    # prior / process-noise models
+include("reperror.jl")     # representativeness (reconstruction-error) model
 include("kalman.jl")       # THE filter: KFModel, StaticObs/VaryingObs, run_filter, KFHistory, ...
 
 using LinearAlgebra
@@ -42,12 +43,30 @@ of the observation-error covariance, R_base = R_sensor (+ R_rep if `rep` given).
 truncation (with tail clutter) is then `truncated_obs(Hfull, R_base, mdl.Σ_α0, r)`.
 """
 function obs_operator_and_base_R(ms::measSet, basis::PODBasis, domain::AnalysisDomain,
-                                 mvar::Matrix{Float32}; rep::Union{RepError,Nothing}=nothing)
+                                 mvar::Matrix{Float32};
+                                 rep::Union{RepError,RepErrorLR,Nothing}=nothing)
 	nm = length(ms.measurements)
 	H  = Float64.(build_measurement_operator(ms, basis, domain))
 	R  = Float64.(build_measurement_covariance(nm, mvar))
 	isnothing(rep) || (R += Float64.(build_rep_covariance(ms, rep, domain)))
 	return H, R
+end
+
+"""
+    rank_r_obs(Hfull, R_base, Σ0full, r; rep=nothing) -> StaticObs
+
+Rank-r static observation model. With a RepErrorLR, R_base already holds the error of the
+discarded modes r+1:L (its residual is taken against the leading r modes), so NO tail clutter
+is added and rep.rank must equal r. Otherwise (kernel RepError, or no rep model) this is
+`truncated_obs` — honest truncation with the Σ0 tail folded into R.
+"""
+function rank_r_obs(Hfull::AbstractMatrix, R_base::AbstractMatrix, Σ0full::AbstractMatrix, r::Int;
+                    rep::Union{RepError,RepErrorLR,Nothing}=nothing)
+	if rep isa RepErrorLR
+		rep.rank == r || error("rank_r_obs: RepErrorLR built for rank $(rep.rank), filter rank $r")
+		return StaticObs(Hfull[:, 1:r], R_base)
+	end
+	return truncated_obs(Hfull, R_base, Σ0full, r)
 end
 
 # ---------------------------------------------------------------------------

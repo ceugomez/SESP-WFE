@@ -1,6 +1,13 @@
-# pod_ensemble.jl
-# DESCRIPTION
+# pod.jl
 # cgf cego6160@colorado.edu 4.1.26
+#
+# Snapshot POD (Sirovich 1987) over an ensemble: the basis Pr, its modal coefficients, the
+# leave-one-member-out fold bases (sliced from one shared Gram matrix), the held-out residual
+# (closure) curve, the eigenvalue spectrum, and point-referenced covariance maps.
+#
+# Conventions: the POD is UNCENTERED (mean flow kept, so the forcing distribution is in the
+# basis) and uses the plain Euclidean inner product over the masked [u;v;w] state — no
+# cell-volume or per-component weighting.
 
 using NCDatasets
 using LinearAlgebra
@@ -8,13 +15,14 @@ using Statistics
 using JSON3 
 using JLD2
 
-# PODBasis struct, includes all the stuff we need to do sequential estimation
+# A truncated POD basis and the modal coefficients of the snapshots it was built from.
 struct PODBasis
-    coeffs        :: Matrix{Float32}   # (?,?) - POD modal coefficients for all timesteps. as (rows=modes, cols=timesteps)
+    coeffs        :: Matrix{Float32}   # (L, N) modal coefficients a = Prᵀx of every training snapshot,
+                                       #        member-blocks of T post-spin-up snapshots each
     modes         :: Matrix{Float32}   # (state_dim, L) — orthonormal POD modes Pr_k (PrᵀPr=I)
     eigenvalues   :: Vector{Float64}   # (L,) descending in magnitude
-    L             :: Int               # length of eigenvalues/modes
-    n_snapshots   :: Int               # number of snapshots ()
+    L             :: Int               # number of retained modes
+    n_snapshots   :: Int               # N = M·T training snapshots
     grid          :: GridInfo          # grid definition, see fasteddy_io.jl
     member_ids    :: Vector{String}    # ids of members used to build this basis, in column-block order
     truth_id      :: String            # id of the member held out / treated as truth for this basis
@@ -74,6 +82,8 @@ project(basis::PODBasis, X::AbstractVecOrMat) = basis.modes' * X
 # per held-out member (Parseval): with a = Prᵀx and per-mode captured
 # energy eᵢ = Σ_t a[i,t]², the residual fraction at rank r is
 #     E_resid(r) = 1 - (Σ_{i≤r} eᵢ) / Σ_t ‖x_t‖² .
+# NOTE the denominator is TOTAL energy (mean flow included), which with a ~10 m/s mean
+# makes the fractions look small; normalize by fluctuation energy when quoting closure.
 # The smallest r where E_resid(r) drops below the observation-noise floor is the
 # defensible truncation rank and quantifies the family-closure error.
 
@@ -318,13 +328,6 @@ function compute_pod_streaming(members::Vector{MemberInfo}, grid::GridInfo,
     return basis, gram
 end
 
-# Build a leave-one-out POD basis for `held_id` directly from an already-computed full-pool
-# Gram matrix `gram`, by slicing that member's rows/cols out and re-eigendecomposing the
-# (smaller) submatrix — skipping Pass 1 of compute_pod_streaming entirely, since its O(M²)
-# pairwise state_dim-length GEMMs are exactly the work `gram` already paid for once when the
-# full-pool basis was built. Only the "other" members' physical snapshots are touched (mode
-# recovery, one read each via `cache` if supplied); their modal coefficients come for free
-# from the same Λ^{1/2}Vᵀ identity used in compute_pod_streaming — no reread needed there either.
 # Slice a member's rows/cols out of a full-pool Gram matrix, returning a smaller PODGram
 # over the remaining members. Reused both by loo_basis_from_gram (to eigendecompose the
 # reduced pool) and by nested leave-one-out (e.g. build_rep_error's inner folds), so a
@@ -343,6 +346,13 @@ function gram_slice(gram::PODGram, held_id::String) :: PODGram
     return PODGram(gram.C[other_cols, other_cols], other_ids, T)
 end
 
+# Build a leave-one-out POD basis for `held_id` directly from an already-computed full-pool
+# Gram matrix `gram`, by slicing that member's rows/cols out and re-eigendecomposing the
+# (smaller) submatrix — skipping Pass 1 of compute_pod_streaming entirely, since its O(M²)
+# pairwise state_dim-length GEMMs are exactly the work `gram` already paid for once when the
+# full-pool basis was built. Only the "other" members' physical snapshots are touched (mode
+# recovery, one read each via `cache` if supplied); their modal coefficients come for free
+# from the same Λ^{1/2}Vᵀ identity used in compute_pod_streaming — no reread needed there either.
 function loo_basis_from_gram(gram::PODGram, members::Vector{MemberInfo}, grid::GridInfo,
                               domain::AnalysisDomain;
                               held_id::String, L::Int, t_spinup::Float64,
@@ -570,7 +580,7 @@ function correlation_column(basis::PODBasis, ref_idx::Int;
     return Float32.(corr)
 end
 
-# Convenience: two-point map about a physical reference point (x,y metres; z metres AGL)
+# Two-point map about a physical reference point (x,y metres; z metres AGL)
 # and component (:u/:v/:w), returned as an NCfield ready for write_fasteddy_nc.
 # normalize=false → covariance; normalize=true → correlation in [−1, 1].
 function covariance_map(basis::PODBasis, domain::AnalysisDomain;
@@ -591,18 +601,4 @@ function covariance_map(basis::PODBasis, domain::AnalysisDomain;
                   reshape(v3, size(v3)..., 1),
                   reshape(w3, size(w3)..., 1))
     return (ncf = ncf, cell = (i, j, k), comp = comp)
-end
-
-# Correlation map — thin wrapper over covariance_map with normalize=true.
-correlation_map(basis::PODBasis, domain::AnalysisDomain; kwargs...) =
-    covariance_map(basis, domain; normalize=true, kwargs...)
-
-# Reconstruct NCfield from POD basis and coefficient vector(s).
-# a_hat is (L,) for a single timestep or (L, T) for a time series.
-# Reconstruction: x = Pr * a_hat  (modes * coefficients → state vector)
-function reconstruct_from_pod(basis::PODBasis, a_hat::AbstractVecOrMat{<:Real},
-                               t::Vector{Float32}, domain::AnalysisDomain) :: NCfield
-    Pr = basis.modes                          # (domain.state_dim, L)
-    X = Float32.(Pr * Float64.(a_hat))        # (domain.state_dim, T)
-    return unpack_to_NCfield(X, t, basis.grid, domain)
 end

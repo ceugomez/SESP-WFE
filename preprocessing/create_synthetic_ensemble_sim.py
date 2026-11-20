@@ -28,16 +28,16 @@ SEED         = 7291        # RNG seed for reproducibility
 
 # Prior mean state (idealized westerly, neutral)
 MU_SPD_MS    = 10.0        # mean geostrophic wind speed [m/s]
-MU_DIR_DEG   = 270.0       # mean met direction [deg]; 270 = westerly
+MU_DIR_DEG   = 270.0       # mean met direction [deg]; 270 = westerly, truth run at the mean
 SIGMA_SPD_MS = 1.5         # std dev of speed [m/s]
-SIGMA_DIR_DEG = 20.0       # std dev of direction [deg]
+SIGMA_DIR_DEG = 3.0       # std dev of direction [deg]
 
-# Truth member offset from mean (can be zero for a clean test)
-TRUTH_DIR_DEG = 265.0      # fix truth dir, or set to None to sample independently
+# Truth member: a fresh run at the ensemble mean (270 deg / 10 m/s); it is NOT the highvar truth (265 deg).
+TRUTH_DIR_DEG = 270.0      # fix truth dir, or set to None to sample independently
 TRUTH_SPD_MS  = 10.0       # fix truth speed, or set to None to sample independently
 
 # Paths
-BASE_RUN_DIR  = "/home/cego6160/workspace/ensemble_runs_paper/ensemble"
+BASE_RUN_DIR  = "/home/cego6160/workspace/ensemble_runs_paper/ensemble-lowvar"
 TEMPLATE_FILE = "/home/cego6160/workspace/ensemble_runs_paper/SESP-WFE/preprocessing/FE_template.in"
 TOPO_FILE     = "/home/cego6160/workspace/ensemble_runs_paper/validation_sponge/setup/terrain_steep.bin"
 CONFIG_OUT    = os.path.join(BASE_RUN_DIR, "ensemble_config.json")
@@ -131,7 +131,7 @@ def write_namelist(template_path: str, member_dir: str, member_id: str,
     replacements = {
         "INPATH_PLACEHOLDER":   "",   # cold start — no IC file needed
         "INFILE_PLACEHOLDER":   "",
-        "OUTPATH_PLACEHOLDER":  out_dir,
+        "OUTPATH_PLACEHOLDER":  out_dir + "/",  # FastEddy concatenates outPath+outFileBase
         "MEMBER_PLACEHOLDER":   member_id,
         "TOPOFILE_PLACEHOLDER": TOPO_FILE,
         "UG_PLACEHOLDER":       f"{U_g:.6f}",

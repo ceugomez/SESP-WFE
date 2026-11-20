@@ -1,12 +1,16 @@
 # statmodel.jl
 # cgf cego6160@colorado.edu 5.19.26
-# regress statistical evolution, prior, measurement error model from ensemble set
+#
+# The offline statistical models of the POD coefficients, regressed from the ensemble:
+# prior mean/covariance (manuscript Eqs. 14–15) and random-walk process noise (Eq. 13).
+# The representativeness-error model is in reperror.jl.
 include("pod.jl");
 
+# Prior + process noise for a full-rank (L) basis. kalman.jl truncates to rank r.
 struct models
-    Qα     :: Matrix{Float32}   # LxL matrix of process noise covariances for evolution of coeff α
-    μ_α0   :: Vector{Float32}   # Mx1 vector of prior means for coeff α (maybe just a normal dist)
-    Σ_α0   :: Matrix{Float32}   # MxM prior covariance matrix for coeff α  
+    Qα     :: Matrix{Float32}   # (L, L) process-noise covariance of α per snapshot interval (6 s)
+    μ_α0   :: Vector{Float32}   # (L,)   prior mean of α
+    Σ_α0   :: Matrix{Float32}   # (L, L) prior covariance of α
 end
 
 
@@ -39,7 +43,7 @@ end
 #   P_0 = (1 / (M·N_t - 1)) Σ_{i,n} (α^(i)(t_n) - α_0)(α^(i)(t_n) - α_0)'
 #
 # basis.coeffs is (L, N) with N = M·N_t columns (member-blocks of post-spinup snapshots),
-# so this is just the column-wise mean and unbiased sample covariance fir
+# so this is just the column-wise mean and unbiased sample covariance.
 function get_prior_from_ensemble(basis::PODBasis)
     a    = basis.coeffs                              # (L, N), N = M·N_t
     μ_α0 = vec(mean(a; dims=2))                       # (L,)
@@ -57,6 +61,11 @@ end
 # i.e. for each member compute the sample covariance of its own increments (about that
 # member's mean increment), then average those per-member covariances over the M members.
 # basis.coeffs is (L, N) in equal member-blocks of T = N/M columns ordered by time.
+#
+# The lag is ONE snapshot interval (6 s). Drivers assimilating every s-th snapshot scale this
+# by s (`qscale`), which is exact only for uncorrelated increments; measured on the highvar
+# truth basis the true lag-s increment variance differs from s·Qα by 0.14–9× per mode at
+# s = 5–20. Compute Q at the actual lag before trusting strided runs.
 function get_process_noise(basis::PODBasis)
     a = basis.coeffs                                  # (L, N)
     L = basis.L

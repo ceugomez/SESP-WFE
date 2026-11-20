@@ -1,116 +1,45 @@
 # measurement.jl
 # cgf cego6160@colorado.edu 4.2.26
-# functions to retrieve noisy measurements from a wind field NCfield
+#
+# Synthetic observations of the truth field and the linear measurement model in POD space.
+# A sensor samples the [u,v,w] of the grid cell nearest its location (no interpolation) plus
+# independent Gaussian noise; correspondingly H takes the same cell's rows of the modes:
+#     y_k = H α_k + ε_k,   H = rows of Pr at the sensor cells,   ε_k ~ N(0, R).
 
-using Distributions
-
-# Measurement structure, contains the measurement, index, and 
+# One point measurement: location, grid cell, and noisy [u,v,w].
 struct meas
 	loc    :: Vector{Float32} # x,y,z position in continuous space of sensor
 	locidx :: Vector{Int}     # x,y,z position in grid index space of sensor 
 	val    :: Vector{Float32} # value of the measurement (with noise), as [u,v,w] (m/s)
 end
 
-# set of measurements, at one timestep
+# All measurements taken at one timestep.
 struct measSet
 	measurements::Vector{meas}    # set of measurements
 end
 
-# set of measurements for every timestep 
-function get_measurement_sequence(U::NCfield, grid::GridInfo, domain::AnalysisDomain, nm::Int, mvar::Matrix{Float32}, tidx::Vector{Int})::Vector{measSet}
-	# samples a set of nm measurements across the U truth field
-	# for every timestep in tidx [constant for phase 1, sequential for phase 2]
-	return [get_measurement_set(U, grid, randLocsInBounds(grid, domain, nm), mvar, t) for t in tidx]
-end
-
-# set of static location measurements for every timestep
+# Measurements at the same fixed `locations` (length nm) at every timestep in tidx.
 function get_static_measurement_sequence(U::NCfield, grid::GridInfo, locations::Vector{Vector{Float32}}, domain::AnalysisDomain, nm::Int, mvar::Matrix{Float32}, tidx::Vector{Int})::Vector{measSet}
-	# samples measurements at the same fixed `locations` (length nm) across the U truth field
-	# for every timestep in tidx
 	length(locations) == nm || error("expected $nm static locations, got $(length(locations))")
 	return [get_measurement_set(U, grid, locations, mvar, t) for t in tidx]
 end
 
 
-# takes a scalar measurement from the field at a continous position 
+# One noisy point measurement at `loc` (nearest grid cell), y = x(cell) + ε, ε ~ N(0, diag(var)).
+# Draws from the global RNG: drivers seed it (NOISE_SEED) before sampling.
 function get_scalar_measurement(U::NCfield, grid::GridInfo, loc::Vector{Float32}, var::Matrix{Float32}, tidx::Int)::meas
-	# as below, 
-	# Y = H ζ + ε, (Eq. 5) 
-	# where ε ~ N(0, var)
-	# var = diag(sigma_u, sigma_v, sigma_w)
-	locidx = loc2idx(loc, grid) # get grid index around where measurement was taken
-	# get wind value at nearest location to sensor
+	locidx = loc2idx(loc, grid)
 	val = Float32[U.u[locidx[1], locidx[2], locidx[3], tidx],
 		U.v[locidx[1], locidx[2], locidx[3], tidx],
 		U.w[locidx[1], locidx[2], locidx[3], tidx]]
-	val = val + randn(Float32, 3) .* sqrt.(diag(var))     # measurement + (uncorrelated, but different) noise
+	val = val + randn(Float32, 3) .* sqrt.(diag(var))     # independent noise per component
 	return meas(loc, locidx, val)
 end
 
-# get a set of measurements given locations and variance at time index tidx
+# Measurements at `locs` at time index tidx.
 function get_measurement_set(U::NCfield, grid::GridInfo, locs::Vector{Vector{Float32}}, var::Matrix{Float32}, tidx::Int)::measSet
-	# get a set of measurements given locations and variance at time index tidx
 	m = [get_scalar_measurement(U, grid, loc, var, tidx) for loc in locs]
 	return measSet(m)
-end
-
-# get a uniformly random location within the analysis domain (sponge margin excluded), in continuous space
-function randLocInBounds(grid::GridInfo, domain::AnalysisDomain)::Vector{Float32}
-	# get a random location in bounds. Uniformly distributed across X and Y within the
-	# domain's interior bounding box, randomly sampled index from Z (cuz sigma coords)
-	ix_lo = findfirst(ix -> any(domain.mask[ix, :, :]), 1:grid.Nx)
-	ix_hi = findlast(ix  -> any(domain.mask[ix, :, :]), 1:grid.Nx)
-	iy_lo = findfirst(iy -> any(domain.mask[:, iy, :]), 1:grid.Ny)
-	iy_hi = findlast(iy  -> any(domain.mask[:, iy, :]), 1:grid.Ny)
-	randX = rand(Uniform(grid.xPos[ix_lo, 1, 1], grid.xPos[ix_hi, 1, 1]))
-	randY = rand(Uniform(grid.yPos[1, iy_lo, 1], grid.yPos[1, iy_hi, 1]))
-	randZidx = rand(4:grid.Nz)
-	randZ = grid.zPos[grid.Nx÷2, grid.Ny÷2, randZidx]
-	return Float32[randX, randY, randZ]
-end
-# get a set of uniformly distributed random locations within the analysis domain
-function randLocsInBounds(grid::GridInfo, domain::AnalysisDomain, n::Int)::Vector{Vector{Float32}}
-	return [randLocInBounds(grid, domain) for _ in 1:n]
-end
-
-
-# Generate a flight-track measurement sequence: n_vehicles vehicles wander
-# through the domain as correlated random walks, producing one measurement
-# per vehicle per timestep.
-#   step_frac : fraction of domain extent to move per timestep 
-function get_flighttrack_sequence(U::NCfield, grid::GridInfo, domain::AnalysisDomain, n_vehicles::Int,
-                                  mvar::Matrix{Float32}, tidx::Vector{Int};
-                                  step_frac::Float64=0.1)::Vector{measSet}
-    ix_lo = findfirst(ix -> any(domain.mask[ix, :, :]), 1:grid.Nx)
-    ix_hi = findlast(ix  -> any(domain.mask[ix, :, :]), 1:grid.Nx)
-    iy_lo = findfirst(iy -> any(domain.mask[:, iy, :]), 1:grid.Ny)
-    iy_hi = findlast(iy  -> any(domain.mask[:, iy, :]), 1:grid.Ny)
-    x_lo, x_hi = grid.xPos[ix_lo, 1, 1], grid.xPos[ix_hi, 1, 1]
-    y_lo, y_hi = grid.yPos[1, iy_lo, 1], grid.yPos[1, iy_hi, 1]
-    step_xy = Float32(step_frac * max(x_hi - x_lo, y_hi - y_lo))
-
-    # z extent in physical space at domain centre; step is same fraction
-    z_all   = grid.zPos[grid.Nx÷2, grid.Ny÷2, :]
-    z_lo    = z_all[4]          # keep vehicles above near-surface levels
-    z_hi    = z_all[end]
-    step_z  = Float32(step_frac * (z_hi - z_lo))
-
-    positions = [randLocInBounds(grid, domain) for _ in 1:n_vehicles]
-
-    seq = Vector{measSet}(undef, length(tidx))
-    for (i, t) in enumerate(tidx)
-        seq[i] = get_measurement_set(U, grid, positions, mvar, t)
-        for v in 1:n_vehicles
-            dx    = randn(Float32) * step_xy
-            dy    = randn(Float32) * step_xy
-            dz    = randn(Float32) * step_z
-            new_x = clamp(positions[v][1] + dx, x_lo, x_hi)
-            new_y = clamp(positions[v][2] + dy, y_lo, y_hi)
-            new_z = clamp(positions[v][3] + dz, z_lo, z_hi)
-            positions[v] = Float32[new_x, new_y, new_z]
-        end
-    end
-    return seq
 end
 
 # Transiting observer: ONE point sensor at fixed x and fixed height AGL, translating up
@@ -128,7 +57,7 @@ end
 #
 # NOTE on representativeness: with one sensor per update, build_rep_covariance collapses to
 # diag(σ²_u,σ²_v,σ²_w) at the sensor cell and the L∥/L⊥/θ kernel is never read (see
-# reconstruction_error.md, final note). This sidesteps the non-PSD kernel entirely, but it
+# build_rep_covariance in reperror.jl). This sidesteps the non-PSD kernel entirely, but it
 # does NOT make the rep error white — successive samples along the track remain correlated
 # in space and time, and the filter treats them as independent. Motion decorrelates faster
 # than a static sensor at the same cadence, but the over-counting bias is real: expect NIS
@@ -205,12 +134,12 @@ function build_measurement_covariance(nm::Int, mvar::Matrix{Float32})::Matrix{Fl
 end
 
 
+# Nearest grid cell (i,j,k) to a physical location [x, y, z] (z absolute, matched within
+# that column because the sigma coordinate follows the terrain).
 function loc2idx(loc::Vector{Float32}, grid::GridInfo)::Vector{Int}
-	# for input location in continuous space within the domain
-	# find the closest index in x,y,z grid space and return that values
-	_, ix = findmin(xi -> abs(xi - loc[1]), grid.xPos[:, 1, 1])      # get x closest to loc                                                                                                                          
-	_, iy = findmin(yi -> abs(yi - loc[2]), grid.yPos[1, :, 1])      # get y                                                                                                                                        
-	_, iz = findmin(zi -> abs(zi - loc[3]), grid.zPos[ix, iy, :])    # get z                                                                                                                                      
+	_, ix = findmin(xi -> abs(xi - loc[1]), grid.xPos[:, 1, 1])
+	_, iy = findmin(yi -> abs(yi - loc[2]), grid.yPos[1, :, 1])
+	_, iz = findmin(zi -> abs(zi - loc[3]), grid.zPos[ix, iy, :])
 	return [ix, iy, iz]
 end
 
